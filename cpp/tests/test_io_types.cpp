@@ -131,6 +131,51 @@ TEST(IoTypesTest, fragments_are_handed_back_per_operation)
   EXPECT_EQ(memory[11], kvikio::test::fake_byte(703));
 }
 
+// A failure path reports a whole slice without building a handle list.
+TEST(IoTypesTest, reporting_fragments_calls_back_once_per_fragment)
+{
+  std::array<std::uint8_t, 2> memory{};
+  std::vector<fragment> list{fragment{0, &memory[0], 1, &memory[0]},
+                             fragment{9, &memory[1], 1, &memory[1]}};
+  std::vector<fragment_handle> seen;
+  prepared_io_completion completion{[&seen](std::span<fragment_handle const> handles,
+                                            bool ok) noexcept {
+    EXPECT_FALSE(ok);
+    ASSERT_EQ(handles.size(), 1u);
+    seen.push_back(handles[0]);
+  }};
+  host_buffer buffer{std::move(list)};
+  completion(buffer.fragments(), false);
+  EXPECT_EQ(seen, (std::vector<fragment_handle>{&memory[0], &memory[1]}));
+}
+
+TEST(IoTypesTest, clone_is_an_explicit_copy)
+{
+  std::array<std::uint8_t, 4> memory{};
+  std::vector<fragment> list{fragment{0, memory.data(), 4, &memory[0]}};
+  prepared_io_slice original{range{0, 4}, host_buffer{std::move(list)}};
+  original.priority    = io_priority::low;
+  original.on_complete = std::make_shared<prepared_io_completion>(
+    [](std::span<fragment_handle const>, bool) noexcept {});
+
+  auto const copy = original.clone();
+  EXPECT_EQ(copy.rng.size, 4u);
+  EXPECT_EQ(copy.priority, io_priority::low);
+  EXPECT_EQ(copy.on_complete, original.on_complete);
+  ASSERT_EQ(copy.h_buffer.fragments().size(), 1u);
+  EXPECT_EQ(copy.h_buffer.fragments()[0].handle, &memory[0]);
+  // A separate list: the original still owns its own.
+  EXPECT_NE(copy.h_buffer.fragments().data(), original.h_buffer.fragments().data());
+}
+
+TEST(IoTypesTest, client_tag_belongs_to_the_layer_above)
+{
+  kvikio::test::fake_object object{"fake://object", 10};
+  EXPECT_EQ(object.client_tag(), 0u);
+  object.set_client_tag(42);
+  EXPECT_EQ(object.client_tag(), 42u);
+}
+
 TEST(IoTypesTest, object_identity_defaults_to_this_open)
 {
   kvikio::test::fake_object first{"fake://object", 10};

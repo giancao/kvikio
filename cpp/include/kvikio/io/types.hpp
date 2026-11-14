@@ -207,6 +207,14 @@ struct host_buffer {
     return std::get<std::vector<fragment>>(buffer);
   }
 
+  /// An explicit copy. Copies the fragment list, which allocates.
+  [[nodiscard]] host_buffer clone() const
+  {
+    host_buffer result;
+    result.buffer = buffer;
+    return result;
+  }
+
   std::variant<std::monostate, std::uint8_t*, std::vector<fragment>> buffer;
 };
 
@@ -262,6 +270,17 @@ class prepared_io_completion final {
   {
     std::lock_guard lock(_mutex);
     _callback(handles, success);
+  }
+
+  /// Report every fragment of @p fragments, one callback call per fragment.
+  /// Allocates nothing, so it is usable on failure paths.
+  void operator()(std::span<fragment const> fragments, bool success) noexcept
+  {
+    std::lock_guard lock(_mutex);
+    for (auto const& f : fragments) {
+      fragment_handle const handle = f.handle;
+      _callback(std::span<fragment_handle const>{&handle, 1}, success);
+    }
   }
 
  private:
@@ -322,6 +341,20 @@ struct prepared_io_slice {
   prepared_io_slice& operator=(prepared_io_slice const&)     = delete;
   prepared_io_slice(prepared_io_slice&&) noexcept            = default;
   prepared_io_slice& operator=(prepared_io_slice&&) noexcept = default;
+
+  /// An explicit copy, sharing @c on_complete. Copies a fragment list, which
+  /// allocates.
+  [[nodiscard]] prepared_io_slice clone() const
+  {
+    prepared_io_slice result;
+    result.rng         = rng;
+    result.h_buffer    = h_buffer.clone();
+    result.d_buffer    = d_buffer;
+    result.on_complete = on_complete;
+    result.priority    = priority;
+    result.kind        = kind;
+    return result;
+  }
 
   [[nodiscard]] bool needs_staging() const noexcept { return h_buffer.needs_staging(); }
 
@@ -484,7 +517,16 @@ class io_object : public std::enable_shared_from_this<io_object> {
   /// writable object grows @ref size to cover it; a no-op for read-only objects.
   virtual void note_written(std::size_t /*end*/) const noexcept {}
 
+  /// A value the layer above the engine attaches to this object right after
+  /// opening it, before the object is shared. Engines neither read nor write
+  /// it. Not synchronized.
+  [[nodiscard]] std::uint64_t client_tag() const noexcept { return _client_tag; }
+
+  /// See @ref client_tag.
+  void set_client_tag(std::uint64_t tag) noexcept { _client_tag = tag; }
+
  private:
+  std::uint64_t _client_tag{0};
   std::uint64_t const _open_generation = next_open_generation();
 };
 
