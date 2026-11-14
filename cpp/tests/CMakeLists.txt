@@ -195,6 +195,8 @@ add_dependencies(
 
 kvikio_add_test(NAME IO_CUFILE_POSIX_ENGINE_TEST SOURCES test_io_cufile_posix_engine.cpp)
 
+kvikio_add_test(NAME IO_DEVICE_COPY_BATCH_TEST SOURCES test_io_device_copy_batch.cpp)
+
 kvikio_add_nsys_plugin_test(
   NAME NIC_MONITOR_TEST SOURCES test_nic_monitor.cpp PLUGIN_SOURCES nic/nic_monitor.cpp
 )
