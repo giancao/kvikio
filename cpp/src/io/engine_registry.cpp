@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include <kvikio/io/cufile_posix_engine.hpp>
 #include <kvikio/io/engine_plugin.hpp>
 #include <kvikio/io/engine_registry.hpp>
 #include <kvikio/logger.hpp>
@@ -95,7 +96,11 @@ std::string engine_plugin_file_name(std::string_view name)
   return "libkvikio_engine_" + std::string(name) + ".so";
 }
 
-engine_registry::engine_registry() = default;
+engine_registry::engine_registry()
+{
+  // The engines built into libkvikio.so are available in every registry.
+  _factories.emplace(cufile_posix_engine_name, &make_cufile_posix_engine);
+}
 
 engine_registry::~engine_registry() { shutdown(); }
 
