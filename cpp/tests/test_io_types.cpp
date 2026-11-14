@@ -131,22 +131,49 @@ TEST(IoTypesTest, fragments_are_handed_back_per_operation)
   EXPECT_EQ(memory[11], kvikio::test::fake_byte(703));
 }
 
-// A failure path reports a whole slice without building a handle list.
-TEST(IoTypesTest, reporting_fragments_calls_back_once_per_fragment)
+// A failure path gives a whole slice back without allocating a handle list.
+TEST(IoTypesTest, reporting_fragments_calls_back_once_for_a_short_list)
 {
   std::array<std::uint8_t, 2> memory{};
   std::vector<fragment> list{fragment{0, &memory[0], 1, &memory[0]},
                              fragment{9, &memory[1], 1, &memory[1]}};
-  std::vector<fragment_handle> seen;
-  prepared_io_completion completion{[&seen](std::span<fragment_handle const> handles,
-                                            bool ok) noexcept {
+  std::vector<std::vector<fragment_handle>> calls;
+  prepared_io_completion completion{[&calls](std::span<fragment_handle const> handles,
+                                             bool ok) noexcept {
     EXPECT_FALSE(ok);
-    ASSERT_EQ(handles.size(), 1u);
-    seen.push_back(handles[0]);
+    calls.emplace_back(handles.begin(), handles.end());
   }};
   host_buffer buffer{std::move(list)};
   completion(buffer.fragments(), false);
-  EXPECT_EQ(seen, (std::vector<fragment_handle>{&memory[0], &memory[1]}));
+  ASSERT_EQ(calls.size(), 1u);
+  EXPECT_EQ(calls[0], (std::vector<fragment_handle>{&memory[0], &memory[1]}));
+
+  // A slice without fragments still settles: one call with an empty list.
+  calls.clear();
+  completion(host_buffer{}.fragments(), false);
+  ASSERT_EQ(calls.size(), 1u);
+  EXPECT_TRUE(calls[0].empty());
+}
+
+TEST(IoTypesTest, reporting_a_long_fragment_list_is_batched)
+{
+  std::vector<std::uint8_t> memory(prepared_io_completion::report_batch + 3);
+  std::vector<fragment> list;
+  for (std::size_t i = 0; i < memory.size(); ++i) {
+    list.push_back(fragment{i, &memory[i], 1, &memory[i]});
+  }
+  std::vector<fragment_handle> seen;
+  int calls = 0;
+  prepared_io_completion completion{[&](std::span<fragment_handle const> handles, bool) noexcept {
+    ++calls;
+    seen.insert(seen.end(), handles.begin(), handles.end());
+  }};
+  host_buffer buffer{std::move(list)};
+  completion(buffer.fragments(), true);
+  EXPECT_EQ(calls, 2);
+  ASSERT_EQ(seen.size(), memory.size());
+  EXPECT_EQ(seen.front(), &memory.front());
+  EXPECT_EQ(seen.back(), &memory.back());
 }
 
 TEST(IoTypesTest, clone_is_an_explicit_copy)

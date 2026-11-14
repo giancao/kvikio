@@ -26,6 +26,7 @@
 #include <sys/types.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -272,16 +273,26 @@ class prepared_io_completion final {
     _callback(handles, success);
   }
 
-  /// Report every fragment of @p fragments, one callback call per fragment.
-  /// Allocates nothing, so it is usable on failure paths.
+  /// Report every fragment of @p fragments (a whole slice given back, e.g. on a
+  /// failure path). The callback is called at least once, also for an empty
+  /// list, and exactly once for up to @ref report_batch fragments; a longer
+  /// list is reported in batches. Allocates nothing.
   void operator()(std::span<fragment const> fragments, bool success) noexcept
   {
     std::lock_guard lock(_mutex);
-    for (auto const& f : fragments) {
-      fragment_handle const handle = f.handle;
-      _callback(std::span<fragment_handle const>{&handle, 1}, success);
-    }
+    std::array<fragment_handle, report_batch> handles;
+    do {
+      auto const n = std::min(fragments.size(), report_batch);
+      for (std::size_t i = 0; i < n; ++i) {
+        handles[i] = fragments[i].handle;
+      }
+      _callback(std::span<fragment_handle const>{handles.data(), n}, success);
+      fragments = fragments.subspan(n);
+    } while (!fragments.empty());
   }
+
+  /// Fragments reported per callback call by the fragment-list overload.
+  static constexpr std::size_t report_batch = 64;
 
  private:
   std::mutex _mutex;
