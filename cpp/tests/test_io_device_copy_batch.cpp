@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <kvikio/io/detail/cuda_event.hpp>
 #include <kvikio/io/detail/device_copy_batch.hpp>
 
 #include "utils/utils.hpp"
@@ -92,4 +93,35 @@ TEST(DeviceCopyBatchTest, copies_arrive_on_explicit_and_default_streams)
   // Say which path this machine exercised.
   RecordProperty("batched_on_explicit_stream",
                  device_copy_batch::batches_on(static_cast<CUstream>(explicit_stream)) ? 1 : 0);
+}
+
+// An event recorded after a batch reports the copies done without blocking the caller.
+TEST(CudaEventTest, query_turns_ready_after_the_recorded_work)
+{
+  using kvikio::io::detail::cuda_event;
+  constexpr std::size_t size = 1 << 20;
+  std::vector<std::uint8_t> host(size, 0x3c);
+  kvikio::test::DevBuffer<std::uint8_t> device(size);
+  cudaStream_t stream{};
+  KVIKIO_CHECK_CUDA(cudaStreamCreate(&stream));
+
+  cuda_event event;
+  device_copy_batch batch;
+  batch.add(device.ptr, host.data(), size);
+  ASSERT_EQ(batch.enqueue(stream), CUDA_SUCCESS);
+  ASSERT_EQ(event.record(stream), CUDA_SUCCESS);
+  // Poll, as an engine thread does.
+  CUresult status = event.query();
+  for (int i = 0; i < 100000 && status == CUDA_ERROR_NOT_READY; ++i) {
+    status = event.query();
+  }
+  EXPECT_EQ(status, CUDA_SUCCESS);
+  EXPECT_EQ(to_host(device.ptr, size), host);
+
+  // Moving transfers ownership; the moved-from event is empty.
+  cuda_event moved{std::move(event)};
+  EXPECT_NE(moved.get(), nullptr);
+  EXPECT_EQ(event.get(), nullptr);
+  EXPECT_EQ(moved.synchronize(), CUDA_SUCCESS);
+  KVIKIO_CHECK_CUDA(cudaStreamDestroy(stream));
 }
