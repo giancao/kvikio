@@ -193,6 +193,8 @@ add_dependencies(
   kvikio_engine_test_wrong_name kvikio_engine_test_start_fails
 )
 
+kvikio_add_test(NAME IO_CUFILE_POSIX_ENGINE_TEST SOURCES test_io_cufile_posix_engine.cpp)
+
 kvikio_add_nsys_plugin_test(
   NAME NIC_MONITOR_TEST SOURCES test_nic_monitor.cpp PLUGIN_SOURCES nic/nic_monitor.cpp
 )

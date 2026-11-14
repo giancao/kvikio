@@ -184,7 +184,7 @@ TEST(EngineRegistryTest, names_are_restricted)
               HasSubstr("[a-z0-9_]+"));
 }
 
-TEST(EngineRegistryTest, replaced_engine_stays_valid_until_shutdown)
+TEST(EngineRegistryTest, replaced_engine_belongs_to_whoever_still_holds_it)
 {
   std::shared_ptr<fake_engine> first;
   std::shared_ptr<fake_engine> second;
@@ -195,18 +195,21 @@ TEST(EngineRegistryTest, replaced_engine_stays_valid_until_shutdown)
     registry.select(engine_route::local, "alpha");
     registry.select(engine_route::local, "beta");
     EXPECT_EQ(registry.current(engine_route::local), second.get());
-    // A holder of the replaced engine can still use it.
+    // The registry let go of the replaced engine without shutting it down:
+    // this test is now its only owner and can keep using it.
+    EXPECT_EQ(first.use_count(), 1);
     EXPECT_EQ(first->shutdowns.load(), 0);
 
     registry.shutdown();
     EXPECT_EQ(registry.current(engine_route::local), nullptr);
     EXPECT_TRUE(registry.selected_name(engine_route::local).empty());
-    EXPECT_EQ(first->shutdowns.load(), 1);
+    EXPECT_EQ(first->shutdowns.load(), 0);
     EXPECT_EQ(second->shutdowns.load(), 1);
     // Factories survive a shutdown.
     registry.select(engine_route::local, "alpha");
+    EXPECT_EQ(first->shutdowns.load(), 0);
   }
-  // Destroying the registry shuts down what it still holds.
+  // Destroying the registry shuts down what it still has selected.
   EXPECT_EQ(first->shutdowns.load(), 1);
 }
 

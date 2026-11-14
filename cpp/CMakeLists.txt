@@ -192,6 +192,7 @@ set(SOURCES
     "src/detail/stream.cpp"
     "src/detail/string_utils.cpp"
     "src/detail/utils.cpp"
+    "src/io/cufile_posix_engine.cpp"
     "src/io/engine.cpp"
     "src/io/engine_registry.cpp"
     "src/io/object_identity.cpp"

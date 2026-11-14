@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include <kvikio/io/cufile_posix_engine.hpp>
 #include <kvikio/io/engine_plugin.hpp>
 #include <kvikio/io/engine_registry.hpp>
 #include <kvikio/logger.hpp>
@@ -95,7 +96,11 @@ std::string engine_plugin_file_name(std::string_view name)
   return "libkvikio_engine_" + std::string(name) + ".so";
 }
 
-engine_registry::engine_registry() = default;
+engine_registry::engine_registry()
+{
+  // The engines built into libkvikio.so are available in every registry.
+  _factories.emplace(cufile_posix_engine_name, &make_cufile_posix_engine);
+}
 
 engine_registry::~engine_registry() { shutdown(); }
 
@@ -223,10 +228,14 @@ std::shared_ptr<engine> engine_registry::select(engine_route route,
     created->start();
     started = true;
 
-    std::lock_guard lock(_mutex);
-    _engines.push_back(created);
-    _selected[index] = created;
-    _current[index].store(created.get(), std::memory_order_release);
+    std::shared_ptr<engine> previous;
+    {
+      std::lock_guard lock(_mutex);
+      previous = std::exchange(_selected[index], created);
+      _current[index].store(created.get(), std::memory_order_release);
+    }
+    // `previous` is released here, outside the lock: if this was its last
+    // owner, its destructor stops its threads.
     return created;
   } catch (...) {
     if (started) { created->shutdown(); }
@@ -262,20 +271,17 @@ std::string engine_registry::selected_name(engine_route route) const
 
 void engine_registry::shutdown() noexcept
 {
-  std::vector<std::shared_ptr<engine>> engines;
+  std::array<std::shared_ptr<engine>, engine_route_count> engines;
   {
     std::lock_guard lock(_mutex);
     for (auto& current : _current) {
       current.store(nullptr, std::memory_order_release);
     }
-    for (auto& selected : _selected) {
-      selected.reset();
-    }
-    engines.swap(_engines);
+    engines.swap(_selected);
   }
   // Engines are shut down without the lock: shutdown joins threads.
   for (auto const& e : engines) {
-    e->shutdown();
+    if (e != nullptr) { e->shutdown(); }
   }
 }
 
