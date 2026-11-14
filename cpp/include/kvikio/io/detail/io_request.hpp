@@ -6,6 +6,7 @@
 #pragma once
 
 #include <kvikio/exec/semi_future.hpp>
+#include <kvikio/io/detail/cuda_context.hpp>
 #include <kvikio/io/detail/device_copy_batch.hpp>
 #include <kvikio/io/types.hpp>
 #include <kvikio/shim/cuda.hpp>
@@ -322,7 +323,8 @@ struct device_cpy_request {
       // context to fall back on.
       int const target_device = device_id >= 0 ? device_id : d_buffer.device_id;
       if (target_device < 0) return CUDA_ERROR_INVALID_VALUE;
-      PushAndPopContext const guard{get_primary_cuda_context(target_device)};
+      scoped_context const guard{primary_context(target_device),
+                                 scoped_context::policy::adopt_if_none};
 
       std::size_t skip      = copy_rng.offset - io_rng.offset;
       std::size_t copied    = 0;
@@ -381,7 +383,8 @@ struct device_cpy_request {
       // context to fall back on.
       int const target_device = device_id >= 0 ? device_id : d_buffer.device_id;
       if (target_device < 0) return CUDA_ERROR_INVALID_VALUE;
-      PushAndPopContext const guard{get_primary_cuda_context(target_device)};
+      scoped_context const guard{primary_context(target_device),
+                                 scoped_context::policy::adopt_if_none};
 
       auto const* device_src = d_buffer.data + (io_rng.offset - req_rng.offset);
       std::size_t copied     = 0;
