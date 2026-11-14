@@ -67,7 +67,7 @@ class engine_registry {
   engine_registry();
   engine_registry(engine_registry const&)            = delete;
   engine_registry& operator=(engine_registry const&) = delete;
-  /// Shuts down every engine this registry created.
+  /// Shuts down the selected engines.
   ~engine_registry();
 
   /// The process-wide registry. It lives in `libkvikio.so`, so every module of
@@ -102,8 +102,8 @@ class engine_registry {
    * engine with @p options and starts it. Only then does it become the
    * selection of @p route.
    *
-   * The engine selected before stays alive until this registry is shut down,
-   * so pointers to it remain valid; requests already holding it finish on it.
+   * The registry lets go of the engine selected before. Whoever still holds
+   * it keeps using it and shuts it down; the registry does neither.
    *
    * @return the selected engine
    * @throws engine_selection_error if any step fails. The previous selection of
@@ -114,7 +114,8 @@ class engine_registry {
                                  engine_options const& options = engine_options{});
 
   /// The engine selected for @p route, or null if none is. Lock-free. The
-  /// pointer stays valid until this registry is shut down.
+  /// pointer is valid until the next @ref select of this route or @ref shutdown;
+  /// a component that outlives those takes @ref acquire instead.
   [[nodiscard]] engine* current(engine_route route) const noexcept
   {
     return _current[static_cast<std::size_t>(route)].load(std::memory_order_acquire);
@@ -126,8 +127,8 @@ class engine_registry {
   /// Name of the engine selected for @p route; empty if none is.
   [[nodiscard]] std::string selected_name(engine_route route) const;
 
-  /// Shut down and release every engine this registry created, and clear the
-  /// selections. Factories and loaded plugins stay.
+  /// Shut down and release the selected engines, and clear the selections.
+  /// Factories and loaded plugins stay.
   void shutdown() noexcept;
 
  private:
@@ -142,7 +143,6 @@ class engine_registry {
   mutable std::mutex _mutex;
   std::unordered_map<std::string, engine_factory> _factories;
   std::vector<std::string> _search_path;
-  std::vector<std::shared_ptr<engine>> _engines;  ///< everything created; kept until shutdown
   std::array<std::shared_ptr<engine>, engine_route_count> _selected;
   std::array<std::atomic<engine*>, engine_route_count> _current{};
 };
