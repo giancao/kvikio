@@ -436,7 +436,7 @@ class reactor_dispatch {
     size = std::min(size, typed.size() > offset ? typed.size() - offset : std::size_t{0});
     if (size == 0) return 0;
 
-    auto reactors = owner().next_reactor(typed, 1, io_op_type::host, -1);
+    auto reactors = self().next_reactor(typed, 1, io_op_type::host, -1);
     if (reactors.empty()) throw std::runtime_error("host_read_io: no available reactors");
     return reactors.front()->host_read(typed, offset, size, destination);
   }
@@ -501,7 +501,7 @@ class reactor_dispatch {
                              io_op_type::host_vector_async);
     } catch (...) {
       auto const error = std::current_exception();
-      if (has_device_slice) owner().on_device_dispatch_failure();
+      if (has_device_slice) self().on_device_dispatch_failure();
       auto fail_unsubmitted = [](auto& pending) noexcept {
         for (auto& slice : pending) {
           if (slice.on_complete != nullptr) {
@@ -539,7 +539,7 @@ class reactor_dispatch {
   {
     auto const& typed = as_writable(object);
     if (size == 0) return 0;
-    auto reactors = owner().next_reactor(typed, 1, io_op_type::host_write, -1);
+    auto reactors = self().next_reactor(typed, 1, io_op_type::host_write, -1);
     if (reactors.empty()) throw std::runtime_error("host_write_io: no available reactors");
     return reactors.front()->host_write(typed, offset, size, source);
   }
@@ -596,7 +596,7 @@ class reactor_dispatch {
                                io_op_type::write_vector_async);
       } catch (...) {
         auto const error = std::current_exception();
-        if (has_device_slice) owner().on_device_dispatch_failure();
+        if (has_device_slice) self().on_device_dispatch_failure();
         return exec::make_semi_future<std::size_t>(error);
       }
     }
@@ -659,7 +659,7 @@ class reactor_dispatch {
       slice.priority = priority;
     }
 
-    auto reactors    = owner().next_reactor(typed, slices.size(), operation, device_id);
+    auto reactors    = self().next_reactor(typed, slices.size(), operation, device_id);
     auto coordinator = std::make_shared<grouped_coordinator>(total_bytes, slices.size());
     auto future      = coordinator->get_future();
 
@@ -728,7 +728,7 @@ class reactor_dispatch {
       return future;
     } catch (...) {
       auto const error = std::current_exception();
-      if (has_device_slice) owner().on_device_dispatch_failure();
+      if (has_device_slice) self().on_device_dispatch_failure();
       for (auto& slice : slices) {
         if (slice.on_complete != nullptr) {
           (*slice.on_complete)(slice.h_buffer.fragments(), false);
@@ -818,7 +818,7 @@ class reactor_dispatch {
   }
 
  private:
-  [[nodiscard]] Owner& owner() noexcept { return static_cast<Owner&>(*this); }
+  [[nodiscard]] Owner& self() noexcept { return static_cast<Owner&>(*this); }
 };
 
 }  // namespace kvikio::io::detail
