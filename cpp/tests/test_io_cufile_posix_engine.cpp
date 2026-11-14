@@ -283,6 +283,33 @@ TEST_F(CufilePosixEngineTest, device_read_stages_through_the_injected_source)
   EXPECT_EQ(staging->free_blocks(), 8u) << "every lease was returned";
 }
 
+// Memory from CUDA's stream-ordered allocator (what a pooled memory resource hands out) has no
+// context a worker thread could look up: the context is resolved when the read is submitted.
+TEST_F(CufilePosixEngineTest, device_read_into_memory_from_the_async_allocator)
+{
+  auto staging               = std::make_shared<test_staging>(128 * KiB, 8);
+  auto eng                   = make(staging);
+  auto object                = eng->open(path, open_options{});
+  constexpr std::size_t size = 300 * KiB;
+  cudaStream_t stream{};
+  KVIKIO_CHECK_CUDA(cudaStreamCreate(&stream));
+  void* device = nullptr;
+  KVIKIO_CHECK_CUDA(cudaMallocAsync(&device, size, stream));
+
+  for (int device_id : {0, -1}) {  // named explicitly, and left to the submitting thread
+    KVIKIO_CHECK_CUDA(cudaMemsetAsync(device, 0, size, stream));
+    std::vector<prepared_io_slice> slices;
+    slices.emplace_back(range{4096, size},
+                        device_buffer{static_cast<std::uint8_t*>(device), stream, device_id});
+    EXPECT_EQ(eng->read(*object, std::move(slices)).get(30s), size);
+    std::vector<std::uint8_t> host(size);
+    KVIKIO_CHECK_CUDA(cudaMemcpy(host.data(), device, size, cudaMemcpyDeviceToHost));
+    EXPECT_EQ(host, pattern_bytes(4096, size)) << "device_id " << device_id;
+  }
+  KVIKIO_CHECK_CUDA(cudaFreeAsync(device, stream));
+  KVIKIO_CHECK_CUDA(cudaStreamDestroy(stream));
+}
+
 TEST_F(CufilePosixEngineTest, device_read_waits_for_staging_instead_of_failing)
 {
   // Two blocks, four threads, a read cut into several operations of two blocks each:

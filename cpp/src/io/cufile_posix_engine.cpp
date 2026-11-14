@@ -154,7 +154,18 @@ struct plan_op {
   std::size_t fragment{no_fragment};
   std::size_t offset{0};  ///< file offset
   std::size_t size{0};    ///< bytes to transfer; already clamped to the end of the file
+  /// The CUDA context of the slice's device memory, resolved on the submitting
+  /// thread: a worker thread has no current context to find it with.
+  CUcontext ctx{nullptr};
 };
+
+/// The context that owns the device memory of @p d_buffer. Called on the
+/// submitting thread.
+CUcontext context_of(device_buffer const& d_buffer)
+{
+  if (d_buffer.device_id >= 0) { return get_primary_cuda_context(d_buffer.device_id); }
+  return get_context_from_pointer(d_buffer.data);
+}
 
 class cufile_posix_engine;
 
@@ -408,52 +419,65 @@ class cufile_posix_engine final : public engine {
     req->ops.reserve(n_ops);
 
     for (std::size_t i = 0; i < slices.size(); ++i) {
-      auto const& slice = slices[i];
-      if (slice.is_flush()) {
-        req->ops.push_back(plan_op{i, no_fragment, 0, 0});
-        continue;
-      }
-      if (slice.is_write()) {
-        if (slice.rng.size == 0) { throw std::invalid_argument("cufile_posix: empty write slice"); }
-        if (slice.has_host_request() == slice.has_device_request() || slice.is_fragmented()) {
-          throw std::invalid_argument("cufile_posix: a write slice has exactly one source");
+      auto const& slice   = slices[i];
+      auto const first_op = req->ops.size();
+      plan_slice(*req, i, slice, eof);
+      if (slice.has_device_request()) {
+        auto const ctx = context_of(slice.d_buffer);
+        for (auto op = first_op; op < req->ops.size(); ++op) {
+          req->ops[op].ctx = ctx;
         }
-        req->total_bytes += slice.rng.size;
-        for (std::size_t done = 0; done < slice.rng.size;) {
-          auto const n = std::min(_options.max_operation_bytes, slice.rng.size - done);
-          req->ops.push_back(plan_op{i, no_fragment, slice.rng.offset + done, n});
-          done += n;
-        }
-        continue;
-      }
-      // A read: clamp to the size recorded when the file was opened.
-      auto const clamped = intersect(slice.rng, range{0, eof});
-      req->total_bytes += clamped.size;
-      if (slice.is_fragmented()) {
-        auto const fragments = slice.h_buffer.fragments();
-        for (std::size_t f = 0; f < fragments.size(); ++f) {
-          if (fragments[f].data == nullptr) {
-            throw std::invalid_argument("cufile_posix: a fragment has no memory");
-          }
-          req->ops.push_back(
-            plan_op{i, f, fragments[f].offset, intersect(fragments[f].rng(), range{0, eof}).size});
-        }
-        continue;
-      }
-      if (clamped.empty()) {
-        // Nothing to read, but the slice still settles through one operation.
-        req->ops.push_back(plan_op{i, no_fragment, slice.rng.offset, 0});
-        continue;
-      }
-      for (std::size_t done = 0; done < clamped.size;) {
-        auto const n = std::min(_options.max_operation_bytes, clamped.size - done);
-        req->ops.push_back(plan_op{i, no_fragment, clamped.offset + done, n});
-        done += n;
       }
     }
     req->slices = std::move(slices);
     req->remaining.store(req->ops.size(), std::memory_order_release);
     return req;
+  }
+
+  /// Append the operations of slice @p i to @p req.
+  void plan_slice(request& req, std::size_t i, prepared_io_slice const& slice, std::size_t eof)
+  {
+    if (slice.is_flush()) {
+      req.ops.push_back(plan_op{i, no_fragment, 0, 0});
+      return;
+    }
+    if (slice.is_write()) {
+      if (slice.rng.size == 0) { throw std::invalid_argument("cufile_posix: empty write slice"); }
+      if (slice.has_host_request() == slice.has_device_request() || slice.is_fragmented()) {
+        throw std::invalid_argument("cufile_posix: a write slice has exactly one source");
+      }
+      req.total_bytes += slice.rng.size;
+      for (std::size_t done = 0; done < slice.rng.size;) {
+        auto const n = std::min(_options.max_operation_bytes, slice.rng.size - done);
+        req.ops.push_back(plan_op{i, no_fragment, slice.rng.offset + done, n});
+        done += n;
+      }
+      return;
+    }
+    // A read: clamp to the size recorded when the file was opened.
+    auto const clamped = intersect(slice.rng, range{0, eof});
+    req.total_bytes += clamped.size;
+    if (slice.is_fragmented()) {
+      auto const fragments = slice.h_buffer.fragments();
+      for (std::size_t f = 0; f < fragments.size(); ++f) {
+        if (fragments[f].data == nullptr) {
+          throw std::invalid_argument("cufile_posix: a fragment has no memory");
+        }
+        req.ops.push_back(
+          plan_op{i, f, fragments[f].offset, intersect(fragments[f].rng(), range{0, eof}).size});
+      }
+      return;
+    }
+    if (clamped.empty()) {
+      // Nothing to read, but the slice still settles through one operation.
+      req.ops.push_back(plan_op{i, no_fragment, slice.rng.offset, 0});
+      return;
+    }
+    for (std::size_t done = 0; done < clamped.size;) {
+      auto const n = std::min(_options.max_operation_bytes, clamped.size - done);
+      req.ops.push_back(plan_op{i, no_fragment, clamped.offset + done, n});
+      done += n;
+    }
   }
 
   exec::semi_future<std::size_t> submit(io_object const& obj,
@@ -549,7 +573,8 @@ class cufile_posix_engine final : public engine {
         // Only the part of this operation inside the slice's range goes to the device.
         auto const part = intersect(range{op.offset, op.size}, slice.rng);
         if (!part.empty()) {
-          copy_to_device(slice.d_buffer,
+          copy_to_device(op.ctx,
+                         slice.d_buffer,
                          part.offset - slice.rng.offset,
                          host + (part.offset - op.offset),
                          part.size);
@@ -561,7 +586,7 @@ class cufile_posix_engine final : public engine {
     auto* device      = slice.d_buffer.data + (op.offset - slice.rng.offset);
     auto const stream = resolve_stream(slice.d_buffer.stream);
     if (file.uses_cufile()) {
-      CUcontext ctx{};
+      CUcontext ctx{op.ctx};
       auto const [base, base_size, device_offset] = get_alloc_info(device, &ctx);
       std::ignore                                 = base_size;
       PushAndPopContext scope(ctx);
@@ -578,7 +603,7 @@ class cufile_posix_engine final : public engine {
     auto lease = acquire_staging(req, index, op.size);
     if (lease == nullptr) { return false; }
     staging_release releaser{*this};
-    PushAndPopContext scope(get_context_from_pointer(device));
+    PushAndPopContext scope(op.ctx);
     std::size_t done = 0;
     for (auto* block : lease->blocks()) {
       if (done == op.size) { break; }
@@ -608,7 +633,7 @@ class cufile_posix_engine final : public engine {
     auto* device      = slice.d_buffer.data + (op.offset - slice.rng.offset);
     auto const stream = resolve_stream(slice.d_buffer.stream);
     if (file.uses_cufile()) {
-      CUcontext ctx{};
+      CUcontext ctx{op.ctx};
       auto const [base, base_size, device_offset] = get_alloc_info(device, &ctx);
       std::ignore                                 = base_size;
       PushAndPopContext scope(ctx);
@@ -626,7 +651,7 @@ class cufile_posix_engine final : public engine {
     if (_options.staging == nullptr) {
       throw std::runtime_error("cufile_posix: a device write needs a staging source");
     }
-    PushAndPopContext scope(get_context_from_pointer(device));
+    PushAndPopContext scope(op.ctx);
     for (std::size_t done = 0; done < op.size;) {
       auto result =
         _options.staging->acquire(std::min(op.size - done, _options.staging->block_size()));
@@ -645,14 +670,15 @@ class cufile_posix_engine final : public engine {
     file.note_written(op.offset + op.size);
   }
 
-  void copy_to_device(device_buffer const& d_buffer,
+  void copy_to_device(CUcontext ctx,
+                      device_buffer const& d_buffer,
                       std::size_t device_offset,
                       std::uint8_t const* src,
                       std::size_t size)
   {
     auto const stream = resolve_stream(d_buffer.stream);
     auto* dst         = d_buffer.data + device_offset;
-    PushAndPopContext scope(get_context_from_pointer(dst));
+    PushAndPopContext scope(ctx);
     KVIKIO_CUDA_DRIVER_TRY(
       cudaAPI::instance().MemcpyHtoDAsync(convert_void2deviceptr(dst), src, size, stream),
       std::runtime_error);
