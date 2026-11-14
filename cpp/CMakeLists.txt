@@ -53,6 +53,15 @@ option(KvikIO_BUILD_EXAMPLES "Configure CMake to build examples" ON)
 option(KvikIO_BUILD_TESTS "Configure CMake to build tests" ON)
 option(KvikIO_REMOTE_SUPPORT "Configure CMake to build with remote IO support" ON)
 option(KvikIO_BUILD_NSYS_PLUGIN "Configure CMake to build the Nsight Systems NIC plugin" ON)
+option(KvikIO_USE_ABSEIL_INVOCABLE
+       "Back kvikio::exec::invocable with absl::AnyInvocable instead of the built-in implementation"
+       OFF
+)
+set(KvikIO_ABSEIL_INVOCABLE_TARGET
+    ""
+    CACHE STRING
+          "abseil any_invocable CMake target to compile against (default: absl::any_invocable)"
+)
 
 # ##################################################################################################
 # * conda environment ------------------------------------------------------------------------------
@@ -183,6 +192,9 @@ set(SOURCES
     "src/detail/stream.cpp"
     "src/detail/string_utils.cpp"
     "src/detail/utils.cpp"
+    "src/io/engine.cpp"
+    "src/io/engine_registry.cpp"
+    "src/io/object_identity.cpp"
     "src/shim/cuda.cpp"
     "src/shim/cufile.cpp"
     "src/shim/utils.cpp"
@@ -242,6 +254,26 @@ target_compile_definitions(
          $<$<BOOL:${cuFile_FOUND}>:KVIKIO_CUFILE_FOUND>
          $<$<BOOL:${cuFile_VERSION_API_FOUND}>:KVIKIO_CUFILE_VERSION_API_FOUND>
 )
+
+# kvikio::exec::invocable backend. The definition is public: libkvikio, its engine plugins and
+# every consumer must resolve the type to the same implementation. Only the usage requirements of
+# abseil are taken (COMPILE_ONLY), so libkvikio.so gains no link dependency.
+if(KvikIO_USE_ABSEIL_INVOCABLE)
+  if(KvikIO_ABSEIL_INVOCABLE_TARGET)
+    set(_kvikio_absl_target ${KvikIO_ABSEIL_INVOCABLE_TARGET})
+  elseif(TARGET absl::any_invocable)
+    set(_kvikio_absl_target absl::any_invocable)
+  else()
+    find_package(absl CONFIG REQUIRED)
+    set(_kvikio_absl_target absl::any_invocable)
+  endif()
+  message(
+    STATUS
+      "kvikio::exec::invocable backed by absl::AnyInvocable (target '${_kvikio_absl_target}')"
+  )
+  target_link_libraries(kvikio PUBLIC $<BUILD_INTERFACE:$<COMPILE_ONLY:${_kvikio_absl_target}>>)
+  target_compile_definitions(kvikio PUBLIC KVIKIO_USE_ABSEIL_INVOCABLE)
+endif()
 
 set_target_properties(
   kvikio

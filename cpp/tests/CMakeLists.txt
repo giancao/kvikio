@@ -159,6 +159,40 @@ kvikio_add_test(NAME MMAP_TEST SOURCES test_mmap.cpp)
 
 kvikio_add_test(NAME CONCURRENT_REQUEST_LIMITER_TEST SOURCES test_concurrent_request_limiter.cpp)
 
+kvikio_add_test(NAME EXEC_SEMI_FUTURE_TEST SOURCES test_exec_semi_future.cpp)
+
+kvikio_add_test(NAME IO_TYPES_TEST SOURCES test_io_types.cpp)
+
+# Engine plugins used by IO_ENGINE_REGISTRY_TEST: one source built in several kinds (see the file).
+set(_kvikio_test_plugin_dir "${KvikIO_BINARY_DIR}/gtests/engine_plugins")
+function(kvikio_add_test_engine_plugin name kind)
+  add_library(kvikio_engine_${name} MODULE engine_plugins/test_engine_plugin.cpp)
+  set_target_properties(
+    kvikio_engine_${name}
+    PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${_kvikio_test_plugin_dir}"
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+  )
+  target_compile_definitions(
+    kvikio_engine_${name} PRIVATE KVIKIO_TEST_PLUGIN_NAME="${name}"
+                                  KVIKIO_TEST_PLUGIN_KIND=${kind}
+  )
+  target_link_libraries(kvikio_engine_${name} PRIVATE kvikio::kvikio)
+endfunction()
+kvikio_add_test_engine_plugin(test_good 0)
+kvikio_add_test_engine_plugin(test_bad_abi 1)
+kvikio_add_test_engine_plugin(test_wrong_name 2)
+kvikio_add_test_engine_plugin(test_start_fails 3)
+
+kvikio_add_test(NAME IO_ENGINE_REGISTRY_TEST SOURCES test_io_engine_registry.cpp)
+target_compile_definitions(
+  IO_ENGINE_REGISTRY_TEST PRIVATE KVIKIO_TEST_ENGINE_PLUGIN_DIR="${_kvikio_test_plugin_dir}"
+)
+add_dependencies(
+  IO_ENGINE_REGISTRY_TEST kvikio_engine_test_good kvikio_engine_test_bad_abi
+  kvikio_engine_test_wrong_name kvikio_engine_test_start_fails
+)
+
 kvikio_add_nsys_plugin_test(
   NAME NIC_MONITOR_TEST SOURCES test_nic_monitor.cpp PLUGIN_SOURCES nic/nic_monitor.cpp
 )
