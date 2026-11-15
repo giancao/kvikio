@@ -56,14 +56,17 @@ rapids_logger::sink_ptr make_sink(rapids_logger::level_enum level)
 
 rapids_logger::logger& default_logger()
 {
-  static rapids_logger::logger logger_ = [] {
+  // Intentionally never destroyed: an I/O engine owned by a static object of the host shuts down
+  // during static destruction and may log then, after a function-local static would be gone.
+  // Process exit flushes the sinks' streams.
+  static auto* const logger_ = [] {
     auto const level = get_level_from_env();
-    rapids_logger::logger logger_{"kvikio", {make_sink(level)}};
+    auto* logger     = new rapids_logger::logger{"kvikio", {make_sink(level)}};
     // Pattern: [thread_id][hours:minutes:seconds:microseconds][level ] message
-    logger_.set_pattern("[%6t][%H:%M:%S:%f][%-6l] %v");
-    logger_.set_level(level);
-    return logger_;
+    logger->set_pattern("[%6t][%H:%M:%S:%f][%-6l] %v");
+    logger->set_level(level);
+    return logger;
   }();
-  return logger_;
+  return *logger_;
 }
 }  // namespace KVIKIO_EXPORT kvikio
