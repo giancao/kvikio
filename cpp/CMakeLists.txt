@@ -407,6 +407,7 @@ if(KvikIO_BUILD_URING_HTTP_ENGINE)
     src/io/rest/config.cpp
     src/io/rest/errc.cpp
     src/io/rest/reactor_placement.cpp
+    src/io/rest/rest_reactor.cpp
     src/io/rest/shared_services.cpp
     src/io/rest/http/chunked_decoder.cpp
     src/io/rest/http/classify.cpp

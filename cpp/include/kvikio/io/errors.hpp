@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -111,6 +112,24 @@ class object_changed_error : public std::runtime_error {
  * @c std::system_error and compare its code keep working; the message names
  * the backend and operation and says "not yet implemented".
  */
+
+/**
+ * @brief An operation needed staging memory, the source had none, and nothing
+ *        the engine holds would free any.
+ *
+ * What @c staging_source::exhausted_error makes by default. It is a
+ * @c std::bad_alloc, so callers that treat memory exhaustion as retryable see
+ * it as such. A staging source may report the condition in a type of its own
+ * instead.
+ */
+class staging_exhausted_error : public std::bad_alloc {
+ public:
+  explicit staging_exhausted_error(std::string what) : _what(std::move(what)) {}
+  [[nodiscard]] char const* what() const noexcept override { return _what.c_str(); }
+
+ private:
+  std::string _what;
+};
 
 /**
  * @brief Selecting an engine failed: the name is unknown, its plugin could not
