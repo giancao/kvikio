@@ -12,7 +12,7 @@
 
 #include "io/rest/net/tls_stream.hpp"
 
-#include <cucascade/log/logging.hpp>
+#include <kvikio/io/detail/log.hpp>
 
 #include <pthread.h>
 #include <signal.h>  // NOLINT(modernize-deprecated-headers): POSIX sigset_t / pthread_sigmask
