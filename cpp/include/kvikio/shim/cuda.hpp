@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -118,6 +118,7 @@ class cudaAPI {
   decltype(cuLaunchHostFunc)* LaunchHostFunc{nullptr};
   // Appended after the existing members so their offsets do not change.
   decltype(cuStreamWaitEvent)* StreamWaitEvent{nullptr};
+  decltype(cuStreamQuery)* StreamQuery{nullptr};
 
  private:
   cudaAPI();
