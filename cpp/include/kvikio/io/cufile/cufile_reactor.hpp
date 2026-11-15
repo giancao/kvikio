@@ -6,6 +6,7 @@
 #pragma once
 
 #include <kvikio/io/cufile/config.hpp>
+#include <kvikio/io/cufile/cufile_options.hpp>
 #include <kvikio/io/detail/cuda_event.hpp>
 #include <kvikio/io/detail/io_request.hpp>
 #include <kvikio/io/detail/reactor_dispatch.hpp>
@@ -63,7 +64,7 @@ using kvikio::io::detail::tiered_blocking_queue;
  * of its buffered fd and takes its size from it; a writable object, or one
  * constructed without such an identity, has the base class's open-local one.
  */
-class KVIKIO_EXPORT cufile_io_object final : public io_object {
+class KVIKIO_EXPORT cufile_io_object final : public io_object, public cufile_object_view {
  public:
   /// @p cufile_handle is null when the file was not registered with cuFile; the
   /// reactor then serves every read and write of it through POSIX.  @p identity
@@ -99,18 +100,21 @@ class KVIKIO_EXPORT cufile_io_object final : public io_object {
   }
 
   /// The buffered fd (page cache).  Always valid.
-  [[nodiscard]] int buffered_fd() const noexcept { return _buffered_fd.get(); }
+  [[nodiscard]] int buffered_fd() const noexcept override { return _buffered_fd.get(); }
 
   /// The O_DIRECT fd cuFile was registered against, or -1 when none was opened.
   /// Reads through it are cuFile's; the reactor @c pwrite s aligned write
   /// pieces through it.
-  [[nodiscard]] int direct_fd() const noexcept { return _direct_fd.get(); }
+  [[nodiscard]] int direct_fd() const noexcept override { return _direct_fd.get(); }
 
   /// The handle to pass to @c cuFileRead; null when the GDS fast path is
   /// unavailable for this file.
   [[nodiscard]] CUfileHandle_t cufile_handle() const noexcept { return _cufile_handle; }
 
-  [[nodiscard]] bool cufile_registered() const noexcept { return _cufile_handle != nullptr; }
+  [[nodiscard]] bool cufile_registered() const noexcept override
+  {
+    return _cufile_handle != nullptr;
+  }
 
  private:
   std::string _path;
