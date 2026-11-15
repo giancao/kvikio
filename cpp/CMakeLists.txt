@@ -219,6 +219,8 @@ set(SOURCES
     "src/detail/utils.cpp"
     "src/exec/admission_control.cpp"
     "src/exec/thread_util.cpp"
+    "src/io/rest/config.cpp"
+    "src/io/rest/reactor_placement.cpp"
     "src/io/cufile_posix_engine.cpp"
     "src/io/detail/local_descriptor.cpp"
     "src/io/engine.cpp"
@@ -266,6 +268,8 @@ target_include_directories(
          "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
          "$<BUILD_INTERFACE:${CUDAToolkit_INCLUDE_DIRS}>"
   INTERFACE "$<INSTALL_INTERFACE:include>"
+  # Private headers shared between the library and its engine plugins are included as "io/...".
+  PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
 # Define logging level
@@ -397,17 +401,17 @@ if(KvikIO_BUILD_URING_ENGINE)
   )
 endif()
 
-# The layers under the io_uring HTTP engine: TLS, the HTTP codec, the network transport and S3
-# request signing. An object library for now; it becomes part of the engine plugin. OpenSSL is a
-# dependency of the plugin only.
+# The io_uring HTTP engine for object stores: the REST reactor with the layers under it (TLS, the
+# HTTP codec, the network transport, S3 request signing). OpenSSL and liburing are dependencies of
+# the plugin only.
 if(KvikIO_BUILD_URING_HTTP_ENGINE)
   find_package(OpenSSL REQUIRED)
   add_library(
-    kvikio_uring_http_layers OBJECT
-    src/io/rest/config.cpp
+    kvikio_engine_uring_http SHARED
     src/io/rest/errc.cpp
-    src/io/rest/reactor_placement.cpp
+    src/io/rest/rest_reactor.cpp
     src/io/rest/shared_services.cpp
+    src/io/rest/uring_http_engine.cpp
     src/io/rest/http/chunked_decoder.cpp
     src/io/rest/http/classify.cpp
     src/io/rest/http/content_range.cpp
@@ -429,24 +433,32 @@ if(KvikIO_BUILD_URING_HTTP_ENGINE)
     src/io/tls/record_opener.cpp
     src/io/tls/tls.cpp
   )
+  add_library(kvikio::engine_uring_http ALIAS kvikio_engine_uring_http)
   set_target_properties(
-    kvikio_uring_http_layers
-    PROPERTIES CXX_STANDARD 20
+    kvikio_engine_uring_http
+    PROPERTIES BUILD_RPATH "\$ORIGIN"
+               INSTALL_RPATH "\$ORIGIN"
+               CXX_STANDARD 20
                CXX_STANDARD_REQUIRED ON
                POSITION_INDEPENDENT_CODE ON
   )
-  # The layers include each other's private headers as "io/...", relative to src/.
-  target_include_directories(kvikio_uring_http_layers PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  # The sources include each other's private headers as "io/...", relative to src/. Code that
+  # tests those layers directly gets the same path.
+  target_include_directories(
+    kvikio_engine_uring_http PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>"
+  )
   target_compile_options(
-    kvikio_uring_http_layers PRIVATE -Wall -Wextra -Wconversion -Wsign-conversion
+    kvikio_engine_uring_http PRIVATE -Wall -Wextra -Wconversion -Wsign-conversion
   )
   target_compile_definitions(
-    kvikio_uring_http_layers
+    kvikio_engine_uring_http
     PRIVATE "KVIKIO_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_${KVIKIO_LOGGING_LEVEL}"
   )
   target_link_libraries(
-    kvikio_uring_http_layers PUBLIC kvikio::kvikio $<BUILD_INTERFACE:kvikio_engine_thirdparty>
-                                    PkgConfig::KVIKIO_LIBURING OpenSSL::SSL OpenSSL::Crypto
+    kvikio_engine_uring_http
+    PUBLIC kvikio::kvikio $<BUILD_INTERFACE:kvikio_engine_thirdparty>
+           $<BUILD_INTERFACE:PkgConfig::KVIKIO_LIBURING> $<BUILD_INTERFACE:OpenSSL::SSL>
+           $<BUILD_INTERFACE:OpenSSL::Crypto>
   )
 endif()
 
@@ -537,6 +549,9 @@ if(TARGET kvikio_engine_uring)
 endif()
 if(TARGET kvikio_engine_cufile_reactor)
   install(TARGETS kvikio_engine_cufile_reactor DESTINATION ${lib_dir})
+endif()
+if(TARGET kvikio_engine_uring_http)
+  install(TARGETS kvikio_engine_uring_http DESTINATION ${lib_dir})
 endif()
 
 install(DIRECTORY include/kvikio/ DESTINATION include/kvikio)

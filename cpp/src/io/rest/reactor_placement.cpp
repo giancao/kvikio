@@ -5,6 +5,8 @@
 
 #include "io/rest/reactor_placement.hpp"
 
+#include <kvikio/io/rest/placement.hpp>
+
 #include <kvikio/exec/thread_util.hpp>
 #include <kvikio/io/detail/log.hpp>
 
@@ -266,6 +268,16 @@ std::string describe_rest_pool(rest_pool_plan const& plan,
       << " prio " << (priority.description.empty() ? "default" : priority.description) << "; "
       << plan.reason;
   return out.str();
+}
+
+std::vector<int> planned_reactor_cpus(std::size_t n_reactors,
+                                      bool pin_to_irq_cpus,
+                                      std::optional<nic_topology> const& nic)
+{
+  auto cpus = plan_rest_pool(n_reactors, pin_to_irq_cpus, nic).pin_cpus;
+  std::sort(cpus.begin(), cpus.end());
+  cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end());
+  return cpus;
 }
 
 }  // namespace kvikio::io::rest

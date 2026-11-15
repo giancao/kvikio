@@ -1,0 +1,575 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "io/rest/reactor_placement.hpp"
+#include "io/rest/shared_services.hpp"
+
+#include <kvikio/io/detail/log.hpp>
+#include <kvikio/io/engine_plugin.hpp>
+#include <kvikio/io/errors.hpp>
+#include <kvikio/io/nic_topology.hpp>
+#include <kvikio/io/rest/s3/sigv4_authorizer.hpp>
+#include <kvikio/io/rest/s3/static_credentials.hpp>
+#include <kvikio/io/rest/uring_http_engine.hpp>
+#include <kvikio/io/uri_parser.hpp>
+
+#include <algorithm>
+#include <cctype>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <format>
+#include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+namespace kvikio::io::rest {
+
+namespace {
+
+/// Size the pool (rest_n_reactors 0 = auto from the egress NIC's IRQ steering) and compute the
+/// placement every reactor applies to its own thread before it creates its ring.  Also checks
+/// the dispatch fan-out against the reactor count.  @p nic is what the host discovered about
+/// the egress interface; without it the pool has the default count and is not pinned.
+std::shared_ptr<detail::pool_placement const> plan_pool(
+  std::size_t n_reactors,
+  std::shared_ptr<rest_reactor::reactor_context> const& ctx,
+  std::optional<nic_topology> nic)
+{
+  if (!ctx) { throw std::invalid_argument("rest_ioctx: reactor_context must be non-null"); }
+  auto const& cfg = ctx->cfg();
+  cfg.validate();
+  auto plan = plan_rest_pool(n_reactors, cfg.pin_to_irq_cpus, nic);
+  // The default (2) is clamped to a one-reactor pool, as the hard-coded fan-out always was;
+  // an explicit value above the configured count is a configuration error.
+  if (n_reactors > 0 && cfg.fan_out > n_reactors && cfg.fan_out != config{}.fan_out) {
+    throw std::invalid_argument("rest_ioctx: rest.fan_out (" + std::to_string(cfg.fan_out) +
+                                ") exceeds rest_n_reactors (" + std::to_string(n_reactors) + ")");
+  }
+  // Reactor 0 logs the one startup line once its thread is placed (the priority is known then).
+  return std::make_shared<detail::pool_placement const>(
+    detail::pool_placement{std::move(plan), std::move(nic)});
+}
+
+}  // namespace
+
+uring_http_engine::uring_http_engine(std::size_t n_reactors,
+                                     std::shared_ptr<rest_reactor::reactor_context> ctx,
+                                     std::optional<nic_topology> nic,
+                                     std::shared_ptr<staging_source> staging)
+  : uring_http_engine(plan_pool(n_reactors, ctx, std::move(nic)), ctx, std::move(staging))
+{
+}
+
+uring_http_engine::~uring_http_engine() { shutdown(); }
+
+uring_http_engine::uring_http_engine(std::shared_ptr<detail::pool_placement const> placement,
+                                     std::shared_ptr<rest_reactor::reactor_context> ctx,
+                                     std::shared_ptr<staging_source> staging_owner)
+  : detail::uring_http_resources{std::move(staging_owner)},
+    kvikio::io::detail::reactor_engine<rest_reactor>(
+      uring_http_engine_name,
+      placement->plan.n_reactors,
+      [ctx = std::move(ctx), placement, i = std::size_t{0}]() mutable {
+        auto const index = i++;
+        return std::make_unique<rest_reactor>(
+          ctx, "rest-" + std::to_string(index), index, placement);
+      }),
+    _placement(std::move(placement)),
+    _lister(
+      [this](std::string_view bucket, std::string_view prefix, std::string_view canonical_query) {
+        if (_reactors.empty()) {
+          throw std::runtime_error("rest_ioctx::list_objects: no reactors");
+        }
+        return control_reactor().list_page(bucket, prefix, canonical_query);
+      },
+      _reactors.empty() ? s3::default_max_scanned_objects
+                        : _reactors.front()->get_config().list_max_scanned,
+      _reactors.empty() ? s3::default_max_list_objects
+                        : _reactors.front()->get_config().list_max_matches,
+      "rest_ioctx::list_objects")
+{
+  // An auto-sized pool may be smaller than the configured fan-out: dispatch spans all of it.
+  _config.fan_out =
+    std::clamp<std::size_t>(_config.fan_out, 1, std::max<std::size_t>(1, _reactors.size()));
+  // Created once here and never reassigned: payload leases capture it by
+  // shared_ptr (so they may outlive this ioctx) and the stash gauges read it
+  // without the coordination mutex.
+  if (std::size_t const inflight = footer_resolve_inflight_cap(); inflight > 0) {
+    auto const& cfg   = _reactors.front()->get_config();
+    std::size_t bytes = cfg.footer_resolve_stash_budget;
+    if (bytes == config::footer_resolve_auto) { bytes = 2 * inflight * cfg.footer_probe_bytes; }
+    _footer_budget = std::make_shared<exec::admission_control>(std::max<std::size_t>(bytes, 1));
+  }
+}
+
+rest_reactor& uring_http_engine::control_reactor()
+{
+  if (_reactors.empty()) { throw std::runtime_error("rest_ioctx: no reactors"); }
+  // The least-backlogged reactor, ties rotated: control-plane calls (HEAD, footer probe, LIST,
+  // footer batches) spread over the pool instead of all landing on reactor 0.
+  auto const count = _reactors.size();
+  auto const start = _control_next.fetch_add(1, std::memory_order_relaxed) % count;
+  std::size_t best = start;
+  for (std::size_t d = 1; d < count; ++d) {
+    auto const i = (start + d) % count;
+    if (_reactors[i]->queued_bytes() < _reactors[best]->queued_bytes()) { best = i; }
+  }
+  return *_reactors[best];
+}
+
+transport_stats uring_http_engine::stats() const noexcept
+{
+  transport_stats total;
+  for (auto const& reactor : _reactors) {
+    if (reactor) { total.merge(reactor->stats()); }
+  }
+  return total;
+}
+
+std::size_t uring_http_engine::footer_stash_reserved_bytes() const noexcept
+{
+  return _footer_budget ? _footer_budget->reserved() : 0;
+}
+
+std::size_t uring_http_engine::footer_stash_reserved_peak_bytes() const noexcept
+{
+  return _footer_budget ? _footer_budget->peak_reserved() : 0;
+}
+
+std::size_t uring_http_engine::footer_resolve_inflight_cap() const
+{
+  if (_reactors.empty()) { return 0; }
+  auto const& cfg = _reactors.front()->get_config();
+  // A batch runs on one reactor's connections: the automatic cap is that reactor's
+  // max_connections (more would only queue in its intake while holding stash budget).  An
+  // explicit cap is honoured as given.
+  if (cfg.footer_resolve_max_inflight == config::footer_resolve_auto) {
+    return std::max<std::size_t>(1, cfg.max_connections);
+  }
+  return cfg.footer_resolve_max_inflight;
+}
+
+void uring_http_engine::resolve_footer_objects(
+  std::span<std::string const> paths,
+  std::function<void(footer_resolve_result)> const& on_result,
+  std::stop_token stop)
+{
+  if (paths.empty()) {
+    throw std::invalid_argument("rest_ioctx::resolve_footer_objects: empty batch");
+  }
+  if (_reactors.empty()) {
+    throw std::runtime_error("rest_ioctx::resolve_footer_objects: no reactors");
+  }
+  std::size_t const max_inflight = footer_resolve_inflight_cap();
+  if (max_inflight == 0 || !_footer_budget) {
+    throw std::invalid_argument(
+      "rest_ioctx::resolve_footer_objects: disabled (footer_resolve_max_inflight == 0)");
+  }
+  if (_footer_budget->budget() < _reactors.front()->get_config().footer_probe_bytes) {
+    // A budget below one probe window cannot admit any entry without
+    // over-committing past the cap, so it cannot be honored as a hard cap.
+    throw std::invalid_argument(
+      "rest_ioctx::resolve_footer_objects: footer_resolve_stash_budget smaller than "
+      "footer_probe_bytes");
+  }
+
+  // Parse up front; a bad scheme is a per-entry error (isolation), not a
+  // batch error.  Every path is copied here, once (into `valid_paths` or its parse error), and
+  // the cancellation error is built once: a cancel sweep then delivers each entry by moving,
+  // without allocating, so it completes even while allocation keeps failing.
+  struct parse_error {
+    std::size_t index;
+    std::string path;
+    std::exception_ptr error;
+  };
+  std::vector<std::string> valid_paths;
+  std::vector<object_ref> valid_objects;
+  std::vector<std::size_t> valid_indices;
+  std::vector<parse_error> parse_errors;
+  valid_paths.reserve(paths.size());
+  valid_objects.reserve(paths.size());
+  valid_indices.reserve(paths.size());
+  parse_errors.reserve(paths.size());
+  for (std::size_t i = 0; i < paths.size(); ++i) {
+    try {
+      auto parsed = kvikio::io::parse(paths[i]);
+      if (parsed.scheme != "s3") {
+        throw std::invalid_argument("rest_ioctx::resolve_footer_objects: unsupported scheme '" +
+                                    parsed.scheme + "'");
+      }
+      valid_paths.push_back(paths[i]);
+      valid_objects.push_back(object_ref{std::move(parsed.host), std::move(parsed.path)});
+      valid_indices.push_back(i);
+    } catch (...) {
+      // A malformed path joins bad-scheme paths as a per-entry error —
+      // parsing must never cost the batch its exactly-once delivery.
+      parse_errors.push_back(parse_error{i, {}, std::current_exception()});
+      parse_errors.back().path = paths[i];
+    }
+  }
+
+  std::exception_ptr callback_error;
+  auto deliver_guarded = [&](std::size_t index, std::string&& path, std::exception_ptr error) {
+    footer_resolve_result r;
+    r.index = index;
+    r.path  = std::move(path);
+    r.error = std::move(error);
+    try {
+      on_result(std::move(r));
+    } catch (...) {
+      // First exception wins; later throws during a cancel sweep are
+      // suppressed.
+      if (!callback_error) { callback_error = std::current_exception(); }
+    }
+  };
+  std::exception_ptr canceled;
+  try {
+    canceled =
+      std::make_exception_ptr(std::system_error(std::make_error_code(std::errc::operation_canceled),
+                                                "rest_ioctx::resolve_footer_objects: canceled"));
+  } catch (...) {
+    canceled = std::current_exception();  // the allocation failure is the error delivered
+  }
+  // Every entry not yet delivered, as canceled (allocation-free).
+  auto cancel_from = [&](std::size_t parse_pos) {
+    for (std::size_t p = parse_pos; p < parse_errors.size(); ++p) {
+      deliver_guarded(parse_errors[p].index, std::move(parse_errors[p].path), canceled);
+    }
+    for (std::size_t v = 0; v < valid_indices.size(); ++v) {
+      deliver_guarded(valid_indices[v], std::move(valid_paths[v]), canceled);
+    }
+  };
+
+  // FIFO admission: one active batch per ioctx; the wait is stop-aware, so a
+  // queued batch whose token fires is removed without ever becoming active.
+  {
+    std::unique_lock lk(_footer_resolve_mutex);
+    std::uint64_t const ticket = _footer_resolve_next_ticket++;
+    _footer_resolve_queue.push_back(ticket);
+    bool const admitted = _footer_resolve_cv.wait(lk, stop, [&] {
+      return !_footer_resolve_active && !_footer_resolve_queue.empty() &&
+             _footer_resolve_queue.front() == ticket;
+    });
+    if (!admitted) {
+      std::erase(_footer_resolve_queue, ticket);
+      lk.unlock();
+      _footer_resolve_cv.notify_all();
+      cancel_from(0);
+      if (callback_error) { std::rethrow_exception(callback_error); }
+      return;
+    }
+    _footer_resolve_active = true;
+    _footer_resolve_queue.pop_front();
+  }
+
+  struct gate_release {
+    uring_http_engine* self;
+    ~gate_release()
+    {
+      {
+        std::lock_guard lk(self->_footer_resolve_mutex);
+        self->_footer_resolve_active = false;
+      }
+      self->_footer_resolve_cv.notify_all();
+    }
+  } release{this};
+
+  // Deliver parse failures first (serial, on this thread); if a callback
+  // throws, every not-yet-delivered entry is swept as canceled and the first
+  // exception is rethrown — same rule as the engine.
+  std::size_t parse_pos = 0;
+  for (; parse_pos < parse_errors.size() && !callback_error; ++parse_pos) {
+    auto& e = parse_errors[parse_pos];
+    deliver_guarded(e.index, std::move(e.path), std::move(e.error));
+  }
+  if (callback_error) {
+    cancel_from(parse_pos);
+    std::rethrow_exception(callback_error);
+  }
+
+  if (valid_indices.empty()) { return; }
+
+  control_reactor().resolve_footer_batch(
+    valid_paths, valid_objects, valid_indices, max_inflight, _footer_budget, on_result, stop);
+}
+
+void uring_http_engine::list_objects_paged(
+  std::string_view bucket,
+  std::string_view prefix,
+  std::size_t page_size,
+  std::function<bool(s3::list_objects_v2_page const&)> const& sink,
+  std::optional<std::size_t> max_scanned)
+{
+  if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::list_objects: no reactors"); }
+  _lister.list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
+}
+
+std::vector<s3::list_entry> uring_http_engine::list_objects(std::string_view bucket,
+                                                            std::string_view prefix,
+                                                            std::size_t page_size,
+                                                            std::optional<std::size_t> max_keys)
+{
+  return _lister.list_objects(bucket, prefix, page_size, max_keys);
+}
+
+std::size_t uring_http_engine::list_max_matches() const { return _lister.list_max_matches(); }
+
+std::shared_ptr<io_object> uring_http_engine::create_io_object(std::string path)
+{
+  auto parsed = kvikio::io::parse(path);
+  if (parsed.scheme != "s3") {
+    throw std::invalid_argument("rest_ioctx::create_io_object: unsupported scheme '" +
+                                parsed.scheme + "'");
+  }
+  if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::create_io_object: no reactors"); }
+
+  // A blocking HEAD (a one-time metadata round-trip) on the least-backlogged reactor (ties
+  // rotated): on its connections while its worker accepts work; before start, after shutdown or
+  // from a reactor thread, on a private helper transport.
+  auto head = control_reactor().head_object(parsed.host, parsed.path);
+  return warn_if_no_strong_etag(std::make_shared<rest_io_object>(std::move(path),
+                                                                 std::move(parsed.host),
+                                                                 std::move(parsed.path),
+                                                                 head.object_size,
+                                                                 std::move(head.etag)));
+}
+
+std::shared_ptr<io_object> uring_http_engine::warn_if_no_strong_etag(std::shared_ptr<io_object> obj)
+{
+  if (rest_io_object::is_strong_tag(obj->validation_tag())) { return obj; }
+  constexpr std::size_t k_max_warned_paths = 64;
+  auto const& path                         = obj->object_path();
+  {
+    std::lock_guard lk(_weak_etag_mtx);
+    if (std::ranges::find(_weak_etag_paths, path) != _weak_etag_paths.end()) { return obj; }
+    if (_weak_etag_paths.size() == k_max_warned_paths) { _weak_etag_paths.clear(); }
+    _weak_etag_paths.push_back(path);
+  }
+  auto const tag = obj->validation_tag();
+  KVIKIO_IO_LOG_WARN(
+    "rest_ioctx: '%s' opened with %s ETag; its bytes and metadata are cached only within this open",
+    path,
+    tag.empty()             ? "no"
+    : tag.starts_with("W/") ? "a weak"
+                            : "a malformed");
+  return obj;
+}
+
+std::shared_ptr<io_object> uring_http_engine::create_io_object(std::string path, open_hint hint)
+{
+  if (hint == open_hint::parquet_footer_probe) {
+    return create_footer_probe_object(std::move(path));
+  }
+  return create_io_object(std::move(path));
+}
+
+std::shared_ptr<io_object> uring_http_engine::create_io_object(std::string path,
+                                                               std::uint64_t known_size)
+{
+  auto parsed = kvikio::io::parse(path);
+  if (parsed.scheme != "s3") {
+    throw std::invalid_argument("rest_ioctx::create_io_object: unsupported scheme '" +
+                                parsed.scheme + "'");
+  }
+  // The size came from a ListObjectsV2 response: build the io_object with zero
+  // network — no HEAD, no probe.
+  return warn_if_no_strong_etag(std::make_shared<rest_io_object>(std::move(path),
+                                                                 std::move(parsed.host),
+                                                                 std::move(parsed.path),
+                                                                 static_cast<size_t>(known_size)));
+}
+
+namespace {
+
+/// The bucket out of an @c s3:// URL, whether or not it names an object.
+///
+/// @c io::parse cannot serve this: it rejects a bucket-only URL with "empty
+/// object key", which is exactly the shape a warm-up takes -- warming is about
+/// the endpoint, and naming a data file to reach it would be beside the point.
+std::optional<std::string> bucket_of(std::string_view url)
+{
+  constexpr std::string_view k_scheme = "s3://";
+  if (url.size() <= k_scheme.size()) { return std::nullopt; }
+  for (std::size_t i = 0; i < k_scheme.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(url[i])) != k_scheme[i]) { return std::nullopt; }
+  }
+  auto const rest   = url.substr(k_scheme.size());
+  auto const bucket = rest.substr(0, rest.find('/'));
+  if (bucket.empty()) { return std::nullopt; }
+  return std::string{bucket};
+}
+
+}  // namespace
+
+void uring_http_engine::warmup(std::string_view bucket_url) noexcept
+{
+  try {
+    // Only the bucket is read: an object key, if the caller passed one, names
+    // nothing the connection pool cares about.
+    auto const bucket = bucket_of(bucket_url);
+    if (!bucket.has_value()) { return; }
+
+    // Connections are per-endpoint, so the bucket -- not the object -- is the
+    // identity that decides whether a warm-up is redundant. A thousand-file
+    // scan calling this per file collapses to one round.
+    {
+      std::lock_guard lk{_warm_mtx};
+      auto const now = std::chrono::steady_clock::now();
+      // conn_max_age of 0 means "no idle cutoff", which leaves no honest staleness horizon;
+      // fall back to a minute rather than re-warm forever.
+      auto const stale_after =
+        _config.conn_max_age.count() > 0
+          ? std::chrono::duration_cast<std::chrono::steady_clock::duration>(_config.conn_max_age)
+          : std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::seconds{60});
+      bool const same_bucket = _warmed_bucket == *bucket;
+      if (same_bucket && _warmed_at.has_value() && now - *_warmed_at < stale_after) { return; }
+      _warmed_bucket = *bucket;
+      _warmed_at     = now;
+    }
+
+    for (auto& reactor : _reactors) {
+      if (reactor) { reactor->warmup(*bucket); }
+    }
+  } catch (...) {  // NOLINT(bugprone-empty-catch)
+    // Warming is an optimization; a query that would have run without it still
+    // runs. Nothing here is worth failing a read over.
+  }
+}
+
+std::shared_ptr<io_object> uring_http_engine::create_footer_probe_object(std::string path)
+{
+  auto parsed = kvikio::io::parse(path);
+  if (parsed.scheme != "s3") {
+    throw std::invalid_argument("rest_ioctx::create_io_object: unsupported scheme '" +
+                                parsed.scheme + "'");
+  }
+  if (_reactors.empty()) { throw std::runtime_error("rest_ioctx::create_io_object: no reactors"); }
+
+  // One suffix-range GET resolves the size and stashes the footer; cuDF's
+  // trailer/footer reads are then served from the stash by host_read.
+  auto& reactor = control_reactor();
+  footer_probe probe =
+    reactor.fetch_footer_suffix(parsed.host, parsed.path, reactor.get_config().footer_probe_bytes);
+  if (!probe.bytes) {
+    // Unusable suffix response (200 full body, 416, missing / "*" Content-Range):
+    // fall back to a plain HEAD for the size, with no stash.
+    auto head = reactor.head_object(parsed.host, parsed.path);
+    return warn_if_no_strong_etag(std::make_shared<rest_io_object>(std::move(path),
+                                                                   std::move(parsed.host),
+                                                                   std::move(parsed.path),
+                                                                   head.object_size,
+                                                                   std::move(head.etag)));
+  }
+  return warn_if_no_strong_etag(std::make_shared<rest_io_object>(std::move(path),
+                                                                 std::move(parsed.host),
+                                                                 std::move(parsed.path),
+                                                                 probe.object_size,
+                                                                 probe.window_lo,
+                                                                 probe.bytes,
+                                                                 std::move(probe.etag)));
+}
+
+// ---------------------------------------------------------------------------
+// Writes: not yet implemented
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<io_object> uring_http_engine::open_for_write(std::string /*path*/,
+                                                             write_open_options const& /*options*/)
+{
+  throw not_implemented_error("rest: open_io_object_for_write");
+}
+
+std::size_t uring_http_engine::host_write(io_object const& /*obj*/,
+                                          std::size_t /*offset*/,
+                                          std::size_t /*size*/,
+                                          std::uint8_t const* /*src*/)
+{
+  throw not_implemented_error("rest: host_write");
+}
+
+exec::semi_future<std::size_t> uring_http_engine::write(
+  io_object const& /*obj*/, std::vector<prepared_io_slice>&& /*slices*/) noexcept
+{
+  try {
+    throw not_implemented_error("rest: mixed_writev_async");
+  } catch (...) {
+    return exec::make_semi_future<std::size_t>(std::current_exception());
+  }
+}
+
+void uring_http_engine::flush(io_object const& /*obj*/)
+{
+  throw not_implemented_error("rest: flush");
+}
+
+exec::semi_future<void> uring_http_engine::flush_async(io_object const& /*obj*/,
+                                                       io_priority /*priority*/) noexcept
+{
+  try {
+    throw not_implemented_error("rest: flush_async");
+  } catch (...) {
+    return exec::make_semi_future<void>(exec::try_t<void>(std::current_exception()));
+  }
+}
+
+std::shared_ptr<io_object> uring_http_engine::open(std::string path, open_options const& options)
+{
+  if (options.known_size.has_value()) {
+    return create_io_object(std::move(path), *options.known_size);
+  }
+  if (options.hint != open_hint::generic) {
+    return create_io_object(std::move(path), options.hint);
+  }
+  return create_io_object(std::move(path));
+}
+
+std::shared_ptr<engine> make_uring_http_engine(engine_options const& options)
+{
+  auto const* typed = dynamic_cast<uring_http_options const*>(&options);
+  if (typed == nullptr) {
+    throw std::invalid_argument("the uring_http engine needs uring_http_options");
+  }
+  auto authorizer = typed->authorizer;
+  if (authorizer == nullptr) {
+    // The signing form follows the object store's s3_signing_mode.
+    auto const& os = typed->object_store;
+    if (os.endpoint.empty() || os.region.empty() || os.access_key.empty() ||
+        os.secret_key.empty()) {
+      throw std::invalid_argument(
+        "the uring_http engine needs a request authorizer or a configured object store "
+        "(endpoint, region and credentials)");
+    }
+    auto creds = s3::static_credentials_from(os);
+    switch (os.s3_signing_mode) {
+      case object_store_config::signing_mode::header:
+        authorizer =
+          std::make_shared<s3::sigv4_header_authorizer>(std::move(creds), os.region, os.endpoint);
+        break;
+      case object_store_config::signing_mode::presigned:
+        authorizer = std::make_shared<s3::sigv4_presigned_authorizer>(
+          std::move(creds), os.region, os.endpoint);
+        break;
+    }
+    if (authorizer == nullptr) {
+      throw std::invalid_argument("the uring_http engine: unknown s3_signing_mode");
+    }
+  }
+  auto context = std::make_shared<rest_reactor::reactor_context>(
+    typed->cfg, std::move(authorizer), typed->staging.get());
+  return std::make_shared<uring_http_engine>(
+    typed->n_reactors, std::move(context), typed->nic, typed->staging);
+}
+
+}  // namespace kvikio::io::rest
+
+KVIKIO_DEFINE_ENGINE_PLUGIN("uring_http", &kvikio::io::rest::make_uring_http_engine)

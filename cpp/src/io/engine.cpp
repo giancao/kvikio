@@ -21,7 +21,16 @@ namespace kvikio::io {
 staging_lease::~staging_lease()   = default;
 staging_source::~staging_source() = default;
 engine_options::~engine_options() = default;
-engine::~engine()                 = default;
+
+std::exception_ptr staging_source::exhausted_error(char const* what) const noexcept
+{
+  try {
+    return std::make_exception_ptr(staging_exhausted_error{what != nullptr ? what : ""});
+  } catch (...) {
+    return std::current_exception();
+  }
+}
+engine::~engine() = default;
 
 void engine::start() {}
 

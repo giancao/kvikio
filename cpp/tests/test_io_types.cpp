@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 #include <kvikio/io/errors.hpp>
 #include <kvikio/io/nic_topology.hpp>
+#include <kvikio/io/staging_source.hpp>
 #include <kvikio/io/types.hpp>
 
 #include "utils/fake_engine.hpp"
@@ -263,4 +264,33 @@ TEST(NicTopologyTest, cpu_lists_are_formatted_as_ranges)
 {
   EXPECT_EQ(format_cpu_list({}), "");
   EXPECT_EQ(format_cpu_list({3, 0, 1, 2, 8, 11, 10, 10}), "0-3,8,10-11");
+}
+
+namespace {
+
+/// A source with no blocks, to exercise the defaults of the interface.
+class empty_staging final : public staging_source {
+ public:
+  [[nodiscard]] std::size_t block_size() const noexcept override { return 4096; }
+  [[nodiscard]] staging_result acquire(std::size_t) noexcept override
+  {
+    return staging_result{staging_status::unavailable, nullptr};
+  }
+};
+
+}  // namespace
+
+// An engine fails an operation with the source's own error; by default a bad_alloc that says why.
+TEST(StagingSourceTest, exhaustion_is_a_bad_alloc_by_default)
+{
+  empty_staging source;
+  auto const error = source.exhausted_error("no staging for bucket/key (4096 bytes)");
+  ASSERT_NE(error, nullptr);
+  try {
+    std::rethrow_exception(error);
+  } catch (staging_exhausted_error const& e) {
+    EXPECT_STREQ(e.what(), "no staging for bucket/key (4096 bytes)");
+    EXPECT_NE(dynamic_cast<std::bad_alloc const*>(&e), nullptr);
+  }
+  EXPECT_NE(source.exhausted_error(nullptr), nullptr);
 }

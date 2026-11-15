@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <span>
 
@@ -81,6 +82,20 @@ class staging_source {
    * serving its other operations.
    */
   [[nodiscard]] virtual staging_result acquire(std::size_t bytes) noexcept = 0;
+
+  /**
+   * @brief The error an operation fails with when the source is exhausted and
+   *        waiting cannot help.
+   *
+   * An engine parks an operation that gets @c staging_status::unavailable as
+   * long as one of its own operations will give blocks back. When none will,
+   * it fails the operation with this error. The default is a
+   * @c staging_exhausted_error; a source overrides it to report exhaustion in
+   * the type its host recognizes, for example one the host retries on.
+   *
+   * @param what describes the operation; never null
+   */
+  [[nodiscard]] virtual std::exception_ptr exhausted_error(char const* what) const noexcept;
 };
 
 }  // namespace kvikio::io
