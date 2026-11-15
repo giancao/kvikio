@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <kvikio/io/cufile_posix_engine.hpp>
+#include <kvikio/io/curl_engine.hpp>
 #include <kvikio/io/engine_plugin.hpp>
 #include <kvikio/io/engine_registry.hpp>
 #include <kvikio/logger.hpp>
@@ -100,6 +101,9 @@ engine_registry::engine_registry()
 {
   // The engines built into libkvikio.so are available in every registry.
   _factories.emplace(cufile_posix_engine_name, &make_cufile_posix_engine);
+#ifdef KVIKIO_LIBCURL_FOUND
+  _factories.emplace(curl_engine_name, &make_curl_engine);
+#endif
 }
 
 engine_registry::~engine_registry() { shutdown(); }

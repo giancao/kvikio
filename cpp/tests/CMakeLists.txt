@@ -228,6 +228,7 @@ if(KvikIO_REMOTE_SUPPORT)
   kvikio_add_test(NAME HDFS_TEST SOURCES test_hdfs.cpp utils/hdfs_helper.cpp)
   kvikio_add_test(NAME TLS_TEST SOURCES test_tls.cpp utils/env.cpp)
   kvikio_add_test(NAME URL_TEST SOURCES test_url.cpp)
+  kvikio_add_test(NAME IO_CURL_ENGINE_TEST SOURCES test_io_curl_engine.cpp utils/env.cpp)
   kvikio_add_test(NAME MULTI_POLL_REACTOR_TEST SOURCES test_multi_poll_reactor.cpp utils/env.cpp)
 endif()
 

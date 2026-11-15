@@ -148,6 +148,43 @@ class CurlMultiAttachment {
   CURL* _easy{nullptr};
 };
 
+struct RemoteMultiTransfer;
+
+/**
+ * @brief Lets the owner of a transfer take over how it is admitted and settled.
+ *
+ * A transfer without hooks belongs to a `RemoteHandle::pread()` call and settles through its
+ * `RemoteMultiAggregateContext`. A transfer with hooks (an I/O engine's) settles through them
+ * instead: the reactor still drives the easy handle, applies the retry policy and the concurrency
+ * limit, but takes no bounce buffer and touches no aggregate for it.
+ *
+ * Every hook runs on the reactor thread, except `fail`, which may also run on a submitting thread
+ * when the pool is dead. None may block.
+ */
+class RemoteMultiTransferHooks {
+ public:
+  enum class Admission {
+    ADMITTED,  ///< Attach the transfer now.
+    DEFERRED,  ///< A resource is missing; ask again on a later pass.
+    FAILED,    ///< The hooks failed the operation themselves; drop the transfer.
+  };
+
+  virtual ~RemoteMultiTransferHooks() = default;
+
+  /// Take what the transfer needs before it starts (e.g. staging memory). Must not throw.
+  [[nodiscard]] virtual Admission admit(RemoteMultiTransfer& transfer) noexcept = 0;
+
+  /// The attempt failed and will be retried: give back what `admit` took.
+  virtual void reset_for_retry(RemoteMultiTransfer& transfer) noexcept = 0;
+
+  /// The transfer finished without error. @p multi can be woken later with `curl_multi_wakeup`.
+  /// A throw is reported through `fail`.
+  virtual void complete(RemoteMultiTransfer& transfer, CURLM* multi) = 0;
+
+  /// The transfer failed for good, or was never started.
+  virtual void fail(std::exception_ptr eptr) noexcept = 0;
+};
+
 /**
  * @brief Per-transfer state owned by a `MultiPollReactor` between submission and completion.
  *
@@ -184,6 +221,12 @@ struct RemoteMultiTransfer {
   std::chrono::steady_clock::time_point ready_at{};
 
   std::shared_ptr<HttpRetryPolicy const> retry_policy;
+
+  // Set for an I/O engine's transfer; `aggregate` is null then. See RemoteMultiTransferHooks.
+  std::unique_ptr<RemoteMultiTransferHooks> hooks;
+
+  // Report a permanent failure to whoever settles this transfer.
+  void report_failed(std::exception_ptr eptr) noexcept;
 
   /**
    * @brief Recycles `buffer` to the bounce-buffer cache if it was not already moved out (due to
