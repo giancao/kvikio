@@ -140,6 +140,16 @@ class engine_registry {
   /// Name of the engine selected for @p route; empty if none is.
   [[nodiscard]] std::string selected_name(engine_route route) const;
 
+  /**
+   * @brief Stop selecting @p e, on every route it is selected for.
+   *
+   * The registry drops its reference; it does not shut the engine down. For the
+   * component that selected an engine and is done with it, so that the engine
+   * (its threads, its staging) goes away with that component instead of staying
+   * selected. Does nothing if @p e is not selected.
+   */
+  void release(engine const* e) noexcept;
+
   /// Shut down and release the selected engines, and clear the selections.
   /// Factories and loaded plugins stay.
   void shutdown() noexcept;

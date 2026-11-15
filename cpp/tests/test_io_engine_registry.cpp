@@ -229,6 +229,26 @@ TEST(EngineRegistryTest, create_makes_a_started_engine_without_selecting_it)
               HasSubstr("cannot create engine 'no_such_engine'"));
 }
 
+TEST(EngineRegistryTest, release_unselects_without_shutting_down)
+{
+  engine_registry registry;
+  std::shared_ptr<fake_engine> made;
+  registry.register_factory("alpha", make_factory("alpha", &made));
+  registry.select(engine_route::local, "alpha");
+  auto const replaced = made;
+  registry.select(engine_route::local, "alpha");
+  // `replaced` is no longer selected: releasing it changes nothing.
+  registry.release(replaced.get());
+  EXPECT_EQ(registry.current(engine_route::local), made.get());
+
+  registry.release(made.get());
+  EXPECT_EQ(registry.current(engine_route::local), nullptr);
+  EXPECT_TRUE(registry.selected_name(engine_route::local).empty());
+  EXPECT_EQ(made->shutdowns.load(), 0);
+  EXPECT_EQ(made.use_count(), 1) << "the registry dropped its reference";
+  registry.release(nullptr);
+}
+
 TEST(EngineRegistryTest, process_wide_instance_is_one_object)
 {
   EXPECT_EQ(&engine_registry::instance(), &engine_registry::instance());

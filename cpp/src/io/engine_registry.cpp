@@ -296,6 +296,21 @@ std::string engine_registry::selected_name(engine_route route) const
   return selected == nullptr ? std::string{} : std::string(selected->name());
 }
 
+void engine_registry::release(engine const* e) noexcept
+{
+  if (e == nullptr) { return; }
+  std::array<std::shared_ptr<engine>, engine_route_count> dropped;
+  {
+    std::lock_guard lock(_mutex);
+    for (std::size_t i = 0; i < engine_route_count; ++i) {
+      if (_selected[i].get() != e) { continue; }
+      _current[i].store(nullptr, std::memory_order_release);
+      dropped[i].swap(_selected[i]);
+    }
+  }
+  // `dropped` is released without the lock: it may be the last reference.
+}
+
 void engine_registry::shutdown() noexcept
 {
   std::array<std::shared_ptr<engine>, engine_route_count> engines;
