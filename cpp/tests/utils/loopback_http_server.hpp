@@ -27,7 +27,10 @@ namespace kvikio::test {
  * @brief A minimal HTTP/1.1 server on 127.0.0.1 serving one byte payload at every path.
  *
  * Answers HEAD and GET, honours `Range: bytes=a-b`, keeps connections alive and sends an ETag.
- * Paths starting with `/missing` answer 404. One thread per connection; enough for tests.
+ * Paths starting with `/missing` answer 404. A GET whose query has `list-type=2` answers an S3
+ * ListObjectsV2 page: two keys and a continuation token first, one more key when the query
+ * carries the token. The `Authorization` header of the last request is kept for inspection.
+ * One thread per connection; enough for tests.
  */
 class LoopbackHttpServer {
  public:
@@ -82,6 +85,21 @@ class LoopbackHttpServer {
 
   [[nodiscard]] std::size_t head_requests() const noexcept { return _heads.load(); }
   [[nodiscard]] std::size_t get_requests() const noexcept { return _gets.load(); }
+  [[nodiscard]] std::size_t list_requests() const noexcept { return _lists.load(); }
+
+  /// The `Authorization` header of the most recent request; empty if it had none.
+  [[nodiscard]] std::string last_authorization() const
+  {
+    std::lock_guard lock(_mutex);
+    return _authorization;
+  }
+
+  /// The request target (path and query) of the most recent request.
+  [[nodiscard]] std::string last_target() const
+  {
+    std::lock_guard lock(_mutex);
+    return _target;
+  }
 
  private:
   void accept_loop()
@@ -135,9 +153,47 @@ class LoopbackHttpServer {
 
   bool respond(int fd, std::string const& head)
   {
-    bool const is_head = head.rfind("HEAD ", 0) == 0;
-    bool const is_get  = head.rfind("GET ", 0) == 0;
-    auto const path    = head.substr(head.find(' ') + 1, 8);
+    bool const is_head   = head.rfind("HEAD ", 0) == 0;
+    bool const is_get    = head.rfind("GET ", 0) == 0;
+    auto const target_at = head.find(' ') + 1;
+    auto const target    = head.substr(target_at, head.find(' ', target_at) - target_at);
+    auto const path      = target.substr(0, 8);
+    bool const is_list   = is_get && target.find("list-type=2") != std::string::npos;
+    std::string authorization;
+    for (char const* name : {"\r\nAuthorization: ", "\r\nauthorization: "}) {
+      auto const at = head.find(name);
+      if (at == std::string::npos) { continue; }
+      auto const begin = at + std::string{name}.size();
+      authorization    = head.substr(begin, head.find("\r\n", begin) - begin);
+    }
+    {
+      std::lock_guard lock(_mutex);
+      _authorization = authorization;
+      _target        = target;
+    }
+    if (is_list) {
+      ++_lists;
+      bool const second = target.find("continuation-token=") != std::string::npos;
+      std::string body  = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>";
+      if (!second) {
+        body +=
+          "<IsTruncated>true</IsTruncated>"
+          "<NextContinuationToken>page-two</NextContinuationToken>"
+          "<Contents><Key>data/part.0.parquet</Key><Size>100</Size>"
+          "<ETag>&quot;e0&quot;</ETag></Contents>"
+          "<Contents><Key>data/part.1.parquet</Key><Size>200</Size>"
+          "<ETag>&quot;e1&quot;</ETag></Contents>";
+      } else {
+        body +=
+          "<IsTruncated>false</IsTruncated>"
+          "<Contents><Key>data/part.2.parquet</Key><Size>300</Size>"
+          "<ETag>&quot;e2&quot;</ETag></Contents>";
+      }
+      body += "</ListBucketResult>";
+      std::string reply = "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: " +
+                          std::to_string(body.size()) + "\r\n\r\n" + body;
+      return send_all(fd, reply.data(), reply.size());
+    }
     if (is_head) { ++_heads; }
     if (is_get) { ++_gets; }
     if (!is_head && !is_get) {
@@ -188,8 +244,11 @@ class LoopbackHttpServer {
   std::atomic<bool> _stop{false};
   std::atomic<std::size_t> _heads{0};
   std::atomic<std::size_t> _gets{0};
+  std::atomic<std::size_t> _lists{0};
   std::thread _acceptor;
-  std::mutex _mutex;
+  mutable std::mutex _mutex;
+  std::string _authorization;
+  std::string _target;
   std::vector<int> _client_fds;
   std::vector<std::thread> _workers;
 };

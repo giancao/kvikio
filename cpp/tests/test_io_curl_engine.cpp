@@ -22,7 +22,9 @@
 #include <kvikio/io/curl_engine.hpp>
 #include <kvikio/io/engine_registry.hpp>
 #include <kvikio/io/errors.hpp>
+#include <kvikio/io/object_listing.hpp>
 
+#include "utils/env.hpp"
 #include "utils/loopback_http_server.hpp"
 #include "utils/test_staging.hpp"
 #include "utils/utils.hpp"
@@ -50,6 +52,17 @@ std::vector<std::uint8_t> pattern_bytes(std::size_t offset, std::size_t size)
 class CurlEngineTest : public testing::Test {
  protected:
   static constexpr std::size_t object_bytes = 3 * MiB + 333;
+
+  /// An engine pointed at the loopback server as its S3 endpoint, signing with @p access_key.
+  std::shared_ptr<engine> select_store(std::string access_key, std::string secret_key = "secret")
+  {
+    curl_options options;
+    options.object_store.endpoint   = server.url("");
+    options.object_store.region     = "us-east-1";
+    options.object_store.access_key = std::move(access_key);
+    options.object_store.secret_key = std::move(secret_key);
+    return registry.select(engine_route::s3, curl_engine_name, options);
+  }
 
   std::shared_ptr<engine> select(std::shared_ptr<staging_source> staging = nullptr,
                                  std::size_t max_operation_bytes         = 16 * MiB)
@@ -265,6 +278,66 @@ TEST_F(CurlEngineTest, a_failed_request_fails_the_read_and_hands_fragments_back)
   slices.back().on_complete = completion;
   EXPECT_ANY_THROW(eng->read(*missing, std::move(slices)).get(30s));
   EXPECT_TRUE(handed_back_failed);
+}
+
+// The options name the object store and its credentials; they win over the environment, and an
+// empty field leaves its environment variable in charge.
+TEST_F(CurlEngineTest, options_override_the_environment_for_s3)
+{
+  kvikio::test::EnvVarContext const env{{"AWS_ACCESS_KEY_ID", "ENVKEY"},
+                                        {"AWS_SECRET_ACCESS_KEY", "envsecret"},
+                                        {"AWS_DEFAULT_REGION", "eu-west-9"}};
+  auto eng    = select_store("OPTIONKEY");
+  auto object = eng->open("s3://bkt/object.bin", open_options{});
+  EXPECT_EQ(object->size(), object_bytes);
+  EXPECT_EQ(server.last_target(), "/bkt/object.bin") << "path-style on the configured endpoint";
+  EXPECT_THAT(server.last_authorization(), HasSubstr("AWS4-HMAC-SHA256"));
+  EXPECT_THAT(server.last_authorization(), HasSubstr("Credential=OPTIONKEY/"));
+  EXPECT_THAT(server.last_authorization(), HasSubstr("/us-east-1/s3/"));
+
+  // The reads are signed the same way.
+  std::vector<std::uint8_t> bytes(4096);
+  std::vector<prepared_io_slice> slices;
+  slices.emplace_back(range{100, bytes.size()}, host_buffer{bytes.data()});
+  EXPECT_EQ(eng->read(*object, std::move(slices)).get(30s), bytes.size());
+  EXPECT_EQ(bytes, pattern_bytes(100, bytes.size()));
+  EXPECT_THAT(server.last_authorization(), HasSubstr("Credential=OPTIONKEY/"));
+
+  // No key in the options: the environment's key, with the options' endpoint and region.
+  auto from_env = select_store("", "");
+  (void)from_env->open("s3://bkt/object.bin", open_options{});
+  EXPECT_THAT(server.last_authorization(), HasSubstr("Credential=ENVKEY/"));
+  EXPECT_THAT(server.last_authorization(), HasSubstr("/us-east-1/s3/"));
+}
+
+// Listing uses the paging logic shared with the uring_http engine; curl fetches the pages.
+TEST_F(CurlEngineTest, lists_a_bucket_page_by_page)
+{
+  auto eng      = select_store("OPTIONKEY");
+  auto* listing = dynamic_cast<object_listing*>(eng.get());
+  ASSERT_NE(listing, nullptr);
+  EXPECT_GT(listing->list_max_matches(), 0u);
+
+  auto const entries = listing->list_objects("bkt", "data/", 2);
+  ASSERT_EQ(entries.size(), 3u);
+  EXPECT_EQ(entries[0].key, "data/part.0.parquet");
+  EXPECT_EQ(entries[1].size, 200u);
+  EXPECT_EQ(entries[2].key, "data/part.2.parquet");
+  EXPECT_EQ(entries[2].etag, "\"e2\"");
+  EXPECT_EQ(server.list_requests(), 2u);
+  EXPECT_THAT(server.last_target(), HasSubstr("/bkt/?continuation-token=page-two&list-type=2"));
+  EXPECT_THAT(server.last_target(), HasSubstr("prefix=data%2F"));
+  EXPECT_THAT(server.last_authorization(), HasSubstr("Credential=OPTIONKEY/"));
+
+  // A sink that stops after the first page sends no second request.
+  std::size_t pages = 0;
+  listing->list_objects_paged("bkt", "data/", 2, [&](rest::s3::list_objects_v2_page const& page) {
+    ++pages;
+    EXPECT_TRUE(page.is_truncated);
+    return false;
+  });
+  EXPECT_EQ(pages, 1u);
+  EXPECT_EQ(server.list_requests(), 3u);
 }
 
 TEST_F(CurlEngineTest, shutdown_rejects_later_requests)

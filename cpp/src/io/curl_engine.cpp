@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -32,6 +33,8 @@
 #include <kvikio/exec/semi_future.hpp>
 #include <kvikio/io/curl_engine.hpp>
 #include <kvikio/io/detail/io_utils.hpp>
+#include <kvikio/io/object_listing.hpp>
+#include <kvikio/io/rest/object_store_lister.hpp>
 #include <kvikio/io/staging_source.hpp>
 #include <kvikio/io/types.hpp>
 #include <kvikio/remote_handle.hpp>
@@ -334,10 +337,18 @@ class op_hooks final : public detail::RemoteMultiTransferHooks {
   std::unique_ptr<staging_lease> _lease;
 };
 
-class curl_engine final : public engine {
+class curl_engine final : public engine, public object_listing {
  public:
   explicit curl_engine(curl_options options)
-    : _options(std::move(options)), _state(std::make_shared<shared_state>())
+    : _options(std::move(options)),
+      _state(std::make_shared<shared_state>()),
+      _lister(
+        [this](std::string_view bucket, std::string_view prefix, std::string_view canonical_query) {
+          return fetch_list_page(bucket, prefix, canonical_query);
+        },
+        rest::s3::default_max_scanned_objects,
+        rest::s3::default_max_list_objects,
+        "curl::list_objects")
   {
     if (_options.max_operation_bytes == 0) { _options.max_operation_bytes = 16UL << 20; }
     _state->staging              = _options.staging;
@@ -390,10 +401,8 @@ class curl_engine final : public engine {
   [[nodiscard]] std::shared_ptr<io_object> open(std::string path,
                                                 open_options const& options) override
   {
-    // Naming the type keeps RemoteHandle from probing the object itself; the
-    // placeholder size keeps it from sending its own HEAD.
-    auto const type = infer_remote_endpoint_type(path);
-    auto handle     = RemoteHandle::open(path, type, std::nullopt, std::size_t{0});
+    auto type   = RemoteEndpointType::S3;
+    auto handle = make_handle(path, type);
     if (options.known_size.has_value()) {
       return std::make_shared<remote_object>(
         std::move(path), std::move(handle), static_cast<std::size_t>(*options.known_size), "");
@@ -488,7 +497,99 @@ class curl_engine final : public engine {
     return future;
   }
 
+  // -- object_listing ---------------------------------------------------------
+
+  void list_objects_paged(std::string_view bucket,
+                          std::string_view prefix,
+                          std::size_t page_size,
+                          std::function<bool(rest::s3::list_objects_v2_page const&)> const& sink,
+                          std::optional<std::size_t> max_scanned) override
+  {
+    _lister.list_objects_paged(bucket, prefix, page_size, sink, max_scanned);
+  }
+
+  [[nodiscard]] std::vector<rest::s3::list_entry> list_objects(
+    std::string_view bucket,
+    std::string_view prefix,
+    std::size_t page_size,
+    std::optional<std::size_t> max_keys) override
+  {
+    return _lister.list_objects(bucket, prefix, page_size, max_keys);
+  }
+
+  [[nodiscard]] std::size_t list_max_matches() const override { return _lister.list_max_matches(); }
+
  private:
+  /// A field of the object store options: set when non-empty, else left to the
+  /// environment variable.
+  [[nodiscard]] static std::optional<std::string> given(std::string const& value)
+  {
+    return value.empty() ? std::nullopt : std::optional<std::string>{value};
+  }
+
+  [[nodiscard]] bool overrides_object_store() const noexcept
+  {
+    auto const& os = _options.object_store;
+    return !(os.endpoint.empty() && os.region.empty() && os.access_key.empty() &&
+             os.secret_key.empty() && os.session_token.empty());
+  }
+
+  /// A handle on @p path that sent no request yet; @p type receives its kind.
+  [[nodiscard]] RemoteHandle make_handle(std::string const& path, RemoteEndpointType& type) const
+  {
+    auto const& os = _options.object_store;
+    if (overrides_object_store() && has_scheme(path, "s3://")) {
+      // The options name the store: sign with them, each empty field falling
+      // back to its environment variable inside the endpoint.
+      type = RemoteEndpointType::S3;
+      return RemoteHandle(std::make_unique<S3Endpoint>(S3Endpoint::parse_s3_url(path),
+                                                       given(os.region),
+                                                       given(os.access_key),
+                                                       given(os.secret_key),
+                                                       given(os.endpoint),
+                                                       given(os.session_token)),
+                          std::size_t{0});
+    }
+    // Naming the type keeps RemoteHandle from probing the object itself; the
+    // placeholder size keeps it from sending its own HEAD.
+    type = infer_remote_endpoint_type(path);
+    if (overrides_object_store() && type == RemoteEndpointType::S3) {
+      return RemoteHandle(std::make_unique<S3Endpoint>(path,
+                                                       given(os.region),
+                                                       given(os.access_key),
+                                                       given(os.secret_key),
+                                                       given(os.session_token)),
+                          std::size_t{0});
+    }
+    return RemoteHandle::open(path, type, std::nullopt, std::size_t{0});
+  }
+
+  /// One ListObjectsV2 page of @p bucket; @p canonical_query is already encoded.
+  [[nodiscard]] std::string fetch_list_page(std::string_view bucket,
+                                            std::string_view prefix,
+                                            std::string_view canonical_query) const
+  {
+    auto const& os = _options.object_store;
+    auto url       = S3Endpoint::url_from_bucket_and_object(
+      std::string{bucket}, std::string{}, given(os.region), given(os.endpoint));
+    url += "?";
+    url += canonical_query;
+    S3Endpoint endpoint{
+      url, given(os.region), given(os.access_key), given(os.secret_key), given(os.session_token)};
+    std::string body;
+    auto curl = create_curl_handle();
+    endpoint.setopt(curl);
+    curl.setopt(CURLOPT_WRITEFUNCTION, &detail::callback_get_string_response);
+    curl.setopt(CURLOPT_WRITEDATA, static_cast<void*>(&body));
+    try {
+      curl.perform([&body] { body.clear(); });
+    } catch (std::exception const& e) {
+      throw std::runtime_error("curl::list_page: " + std::string{e.what()} + " for " +
+                               std::string{bucket} + "/" + std::string{prefix});
+    }
+    return body;
+  }
+
   [[nodiscard]] static remote_object const& typed(io_object const& obj)
   {
     auto const* object = dynamic_cast<remote_object const*>(&obj);
@@ -634,6 +735,7 @@ class curl_engine final : public engine {
   curl_options _options;
   std::shared_ptr<shared_state> _state;
   engine_capabilities _caps;
+  rest::object_store_lister _lister;
 };
 
 }  // namespace

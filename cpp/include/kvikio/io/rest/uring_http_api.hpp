@@ -15,6 +15,7 @@
 
 #include <kvikio/io/engine.hpp>
 #include <kvikio/io/nic_topology.hpp>
+#include <kvikio/io/object_listing.hpp>
 #include <kvikio/io/object_store_config.hpp>
 #include <kvikio/io/rest/authorizer.hpp>
 #include <kvikio/io/rest/config.hpp>
@@ -61,33 +62,16 @@ struct uring_http_options : engine_options {
 /**
  * @brief What the `uring_http` engine offers beyond the engine interface.
  *
- * Reach it with `dynamic_cast<uring_http_api*>(engine)`.
+ * Reach it with `dynamic_cast<uring_http_api*>(engine)`. Listing is the part it
+ * shares with other engines (@c object_listing).
  */
-class uring_http_api {
+class uring_http_api : public object_listing {
  public:
-  virtual ~uring_http_api() = default;
+  ~uring_http_api() override = default;
 
   /// Counters of the whole pool: the reactors' @c transport_stats summed. A
   /// snapshot; safe while the pool runs.
   [[nodiscard]] virtual transport_stats stats() const noexcept = 0;
-
-  /// Stream a bucket's ListObjectsV2 pages under @p prefix to @p sink, one call
-  /// per page, until it returns false or the listing ends.
-  virtual void list_objects_paged(std::string_view bucket,
-                                  std::string_view prefix,
-                                  std::size_t page_size,
-                                  std::function<bool(s3::list_objects_v2_page const&)> const& sink,
-                                  std::optional<std::size_t> max_scanned = std::nullopt) = 0;
-
-  /// The entries of a bucket under @p prefix.
-  [[nodiscard]] virtual std::vector<s3::list_entry> list_objects(
-    std::string_view bucket,
-    std::string_view prefix,
-    std::size_t page_size               = 1000,
-    std::optional<std::size_t> max_keys = std::nullopt) = 0;
-
-  /// The configured cap on the matches of one listing.
-  [[nodiscard]] virtual std::size_t list_max_matches() const = 0;
 
   /// Resolve the size and footer bytes of a batch of objects, reporting each
   /// through @p on_result. Blocks until the batch is done or @p stop is set.
