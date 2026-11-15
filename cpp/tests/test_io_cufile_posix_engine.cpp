@@ -22,6 +22,7 @@
 #include <kvikio/io/engine_registry.hpp>
 #include <kvikio/io/errors.hpp>
 
+#include "utils/test_staging.hpp"
 #include "utils/utils.hpp"
 
 using namespace kvikio::io;
@@ -45,74 +46,7 @@ std::vector<std::uint8_t> pattern_bytes(std::size_t offset, std::size_t size)
   return result;
 }
 
-/// Page-locked-like blocks from the heap, with a fixed number of them.
-class test_staging final : public staging_source {
- public:
-  test_staging(std::size_t block_size, std::size_t n_blocks) : _block_size(block_size)
-  {
-    for (std::size_t i = 0; i < n_blocks; ++i) {
-      _storage.emplace_back(block_size);
-      _free.push_back(reinterpret_cast<std::byte*>(_storage.back().data()));
-    }
-    _total = n_blocks;
-  }
-
-  [[nodiscard]] std::size_t block_size() const noexcept override { return _block_size; }
-
-  [[nodiscard]] staging_result acquire(std::size_t bytes) noexcept override
-  {
-    auto const need = (bytes + _block_size - 1) / _block_size;
-    std::lock_guard lock(_mutex);
-    ++acquires;
-    staging_result result;
-    if (need > _total) { return result; }
-    if (need > _free.size()) {
-      ++unavailable;
-      result.status = staging_status::unavailable;
-      return result;
-    }
-    std::vector<std::byte*> blocks(_free.end() - static_cast<std::ptrdiff_t>(need), _free.end());
-    _free.resize(_free.size() - need);
-    result.lease  = std::make_unique<lease>(*this, std::move(blocks));
-    result.status = staging_status::ok;
-    return result;
-  }
-
-  [[nodiscard]] std::size_t free_blocks()
-  {
-    std::lock_guard lock(_mutex);
-    return _free.size();
-  }
-
-  int acquires{0};
-  int unavailable{0};
-
- private:
-  class lease final : public staging_lease {
-   public:
-    lease(test_staging& owner, std::vector<std::byte*> blocks)
-      : _owner(owner), _blocks(std::move(blocks))
-    {
-    }
-    ~lease() override
-    {
-      std::lock_guard lock(_owner._mutex);
-      _owner._free.insert(_owner._free.end(), _blocks.begin(), _blocks.end());
-    }
-    [[nodiscard]] std::span<std::byte* const> blocks() const noexcept override { return _blocks; }
-    [[nodiscard]] std::size_t block_size() const noexcept override { return _owner._block_size; }
-
-   private:
-    test_staging& _owner;
-    std::vector<std::byte*> _blocks;
-  };
-
-  std::size_t _block_size;
-  std::size_t _total{0};
-  std::mutex _mutex;
-  std::vector<std::vector<std::uint8_t>> _storage;
-  std::vector<std::byte*> _free;
-};
+using kvikio::test::test_staging;
 
 class CufilePosixEngineTest : public testing::Test {
  protected:

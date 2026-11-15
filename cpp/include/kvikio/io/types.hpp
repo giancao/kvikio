@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -65,6 +66,15 @@ inline constexpr std::size_t IO_BLOCK_SIZE = 4096;
     return page > 0 ? std::max(IO_BLOCK_SIZE, static_cast<std::size_t>(page)) : IO_BLOCK_SIZE;
   }();
   return granule;
+}
+
+/// Raise @p target to @p value if it is smaller (an atomic maximum).
+inline void atomic_store_max(std::atomic<std::size_t>& target, std::size_t value) noexcept
+{
+  auto current = target.load(std::memory_order_relaxed);
+  while (current < value &&
+         !target.compare_exchange_weak(
+           current, value, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
 }
 
 /// The half-open byte range [offset, offset + size) of a file or object.

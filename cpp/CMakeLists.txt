@@ -62,6 +62,24 @@ set(KvikIO_ABSEIL_INVOCABLE_TARGET
     CACHE STRING
           "abseil any_invocable CMake target to compile against (default: absl::any_invocable)"
 )
+option(KvikIO_BUILD_URING_ENGINE
+       "Build the io_uring engine plugin (libkvikio_engine_uring.so); needs liburing" ON
+)
+# The reactor engines use moodycamel's lock-free queues, which libkvikio.so itself does not.
+# Resolution order: an existing CMake target, a directory holding concurrentqueue.h, else
+# cameron314/concurrentqueue is fetched.
+set(KvikIO_MOODYCAMEL_TARGET
+    ""
+    CACHE STRING "CMake target that carries the moodycamel concurrentqueue headers"
+)
+set(KvikIO_MOODYCAMEL_INCLUDE_DIR
+    ""
+    CACHE PATH "Directory containing the moodycamel concurrentqueue headers"
+)
+set(KvikIO_MOODYCAMEL_NAMESPACE
+    "moodycamel"
+    CACHE STRING "C++ namespace of the moodycamel headers (DuckDB's copy uses duckdb_moodycamel)"
+)
 
 # ##################################################################################################
 # * conda environment ------------------------------------------------------------------------------
@@ -292,6 +310,70 @@ set_target_properties(
 )
 
 # ##################################################################################################
+# * engine plugins --------------------------------------------------------------------------------
+
+# An engine plugin is a shared library next to libkvikio.so, found there by name by the engine
+# registry. It can also be linked like any library by code that uses the engine's classes directly.
+if(KvikIO_BUILD_URING_ENGINE)
+  find_package(PkgConfig REQUIRED)
+  # GLOBAL: a project embedding KvikIO links the plugin from its own directories.
+  pkg_check_modules(KVIKIO_LIBURING REQUIRED IMPORTED_TARGET GLOBAL liburing)
+
+  add_library(kvikio_engine_thirdparty INTERFACE)
+  if(KvikIO_MOODYCAMEL_TARGET)
+    target_link_libraries(
+      kvikio_engine_thirdparty INTERFACE $<BUILD_INTERFACE:${KvikIO_MOODYCAMEL_TARGET}>
+    )
+  elseif(KvikIO_MOODYCAMEL_INCLUDE_DIR)
+    if(NOT EXISTS "${KvikIO_MOODYCAMEL_INCLUDE_DIR}/concurrentqueue.h")
+      message(
+        FATAL_ERROR
+          "KvikIO_MOODYCAMEL_INCLUDE_DIR does not contain concurrentqueue.h: ${KvikIO_MOODYCAMEL_INCLUDE_DIR}"
+      )
+    endif()
+    target_include_directories(
+      kvikio_engine_thirdparty INTERFACE $<BUILD_INTERFACE:${KvikIO_MOODYCAMEL_INCLUDE_DIR}>
+    )
+  else()
+    include(FetchContent)
+    FetchContent_Declare(
+      concurrentqueue
+      GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
+      GIT_TAG v1.0.4
+    )
+    FetchContent_MakeAvailable(concurrentqueue)
+    target_include_directories(
+      kvikio_engine_thirdparty INTERFACE $<BUILD_INTERFACE:${concurrentqueue_SOURCE_DIR}>
+    )
+  endif()
+  target_compile_definitions(
+    kvikio_engine_thirdparty
+    INTERFACE KVIKIO_MOODYCAMEL_NAMESPACE=${KvikIO_MOODYCAMEL_NAMESPACE}
+  )
+
+  add_library(kvikio_engine_uring SHARED src/io/uring/uring_engine.cpp src/io/uring/uring_reactor.cpp)
+  add_library(kvikio::engine_uring ALIAS kvikio_engine_uring)
+  set_target_properties(
+    kvikio_engine_uring
+    PROPERTIES BUILD_RPATH "\$ORIGIN"
+               INSTALL_RPATH "\$ORIGIN"
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               POSITION_INDEPENDENT_CODE ON
+  )
+  target_compile_options(kvikio_engine_uring PRIVATE -Wall -Wextra -Wconversion -Wsign-conversion)
+  target_compile_definitions(
+    kvikio_engine_uring
+    PRIVATE "KVIKIO_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_${KVIKIO_LOGGING_LEVEL}"
+  )
+  target_link_libraries(
+    kvikio_engine_uring
+    PUBLIC kvikio::kvikio $<BUILD_INTERFACE:kvikio_engine_thirdparty>
+           $<BUILD_INTERFACE:PkgConfig::KVIKIO_LIBURING>
+  )
+endif()
+
+# ##################################################################################################
 # * add benchmarks --------------------------------------------------------------------------------
 
 if(KvikIO_BUILD_BENCHMARKS)
@@ -342,6 +424,10 @@ install(
   DESTINATION ${lib_dir}
   EXPORT kvikio-exports
 )
+
+if(TARGET kvikio_engine_uring)
+  install(TARGETS kvikio_engine_uring DESTINATION ${lib_dir})
+endif()
 
 install(DIRECTORY include/kvikio/ DESTINATION include/kvikio)
 install(FILES ${KvikIO_BINARY_DIR}/include/kvikio/version_config.hpp DESTINATION include/kvikio)

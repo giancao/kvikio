@@ -213,21 +213,55 @@ engine_factory engine_registry::factory_for(std::string_view name)
   return _factories.emplace(std::move(key), std::move(loaded)).first->second;
 }
 
+namespace {
+
+/// What() of the exception being handled.
+std::string current_reason() noexcept
+{
+  try {
+    throw;
+  } catch (std::exception const& e) {
+    try {
+      return e.what();
+    } catch (...) {
+    }
+  } catch (...) {
+  }
+  return "unknown error";
+}
+
+}  // namespace
+
+std::shared_ptr<engine> engine_registry::make_started(std::string_view name,
+                                                      engine_options const& options)
+{
+  // The factory and start() are foreign code: called without the lock.
+  auto const factory = factory_for(name);
+  auto created       = factory(options);
+  if (created == nullptr) { throw engine_selection_error("its factory returned no engine"); }
+  created->start();
+  return created;
+}
+
+std::shared_ptr<engine> engine_registry::create(std::string_view name,
+                                                engine_options const& options)
+{
+  try {
+    return make_started(name, options);
+  } catch (...) {
+    std::string message = "cannot create engine '" + std::string(name) + "': " + current_reason();
+    KVIKIO_LOG_ERROR(message);
+    throw engine_selection_error(message);
+  }
+}
+
 std::shared_ptr<engine> engine_registry::select(engine_route route,
                                                 std::string_view name,
                                                 engine_options const& options)
 {
   auto const index = static_cast<std::size_t>(route);
-  std::shared_ptr<engine> created;
-  bool started = false;
   try {
-    // The factory and start() are foreign code: called without the lock.
-    auto const factory = factory_for(name);
-    created            = factory(options);
-    if (created == nullptr) { throw engine_selection_error("its factory returned no engine"); }
-    created->start();
-    started = true;
-
+    auto created = make_started(name, options);
     std::shared_ptr<engine> previous;
     {
       std::lock_guard lock(_mutex);
@@ -238,14 +272,7 @@ std::shared_ptr<engine> engine_registry::select(engine_route route,
     // owner, its destructor stops its threads.
     return created;
   } catch (...) {
-    if (started) { created->shutdown(); }
-    std::string reason = "unknown error";
-    try {
-      throw;
-    } catch (std::exception const& e) {
-      reason = e.what();
-    } catch (...) {
-    }
+    auto const reason   = current_reason();
     auto const previous = selected_name(route);
     std::string message =
       "cannot select engine '" + std::string(name) + "' for " + std::string(route_name(route)) +
@@ -267,6 +294,21 @@ std::string engine_registry::selected_name(engine_route route) const
   std::lock_guard lock(_mutex);
   auto const& selected = _selected[static_cast<std::size_t>(route)];
   return selected == nullptr ? std::string{} : std::string(selected->name());
+}
+
+void engine_registry::release(engine const* e) noexcept
+{
+  if (e == nullptr) { return; }
+  std::array<std::shared_ptr<engine>, engine_route_count> dropped;
+  {
+    std::lock_guard lock(_mutex);
+    for (std::size_t i = 0; i < engine_route_count; ++i) {
+      if (_selected[i].get() != e) { continue; }
+      _current[i].store(nullptr, std::memory_order_release);
+      dropped[i].swap(_selected[i]);
+    }
+  }
+  // `dropped` is released without the lock: it may be the last reference.
 }
 
 void engine_registry::shutdown() noexcept

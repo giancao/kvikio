@@ -113,6 +113,19 @@ class engine_registry {
                                  std::string_view name,
                                  engine_options const& options = engine_options{});
 
+  /**
+   * @brief Create and start an engine without selecting it.
+   *
+   * For a component that wants an engine of its own (its own threads and
+   * staging) next to the one selected for a route. The caller owns the engine
+   * and shuts it down.
+   *
+   * @throws engine_selection_error if the name is unknown, its plugin cannot be
+   *         loaded, or the engine cannot be created or started.
+   */
+  [[nodiscard]] std::shared_ptr<engine> create(std::string_view name,
+                                               engine_options const& options = {});
+
   /// The engine selected for @p route, or null if none is. Lock-free. The
   /// pointer is valid until the next @ref select of this route or @ref shutdown;
   /// a component that outlives those takes @ref acquire instead.
@@ -127,6 +140,16 @@ class engine_registry {
   /// Name of the engine selected for @p route; empty if none is.
   [[nodiscard]] std::string selected_name(engine_route route) const;
 
+  /**
+   * @brief Stop selecting @p e, on every route it is selected for.
+   *
+   * The registry drops its reference; it does not shut the engine down. For the
+   * component that selected an engine and is done with it, so that the engine
+   * (its threads, its staging) goes away with that component instead of staying
+   * selected. Does nothing if @p e is not selected.
+   */
+  void release(engine const* e) noexcept;
+
   /// Shut down and release the selected engines, and clear the selections.
   /// Factories and loaded plugins stay.
   void shutdown() noexcept;
@@ -135,6 +158,8 @@ class engine_registry {
   /// The factory of @p name, loading its plugin if it has none yet. Throws
   /// @c engine_selection_error.
   [[nodiscard]] engine_factory factory_for(std::string_view name);
+  [[nodiscard]] std::shared_ptr<engine> make_started(std::string_view name,
+                                                     engine_options const& options);
 
   /// Loads the plugin of @p name and returns its factory. Takes no lock while
   /// the plugin's code runs. Throws @c engine_selection_error.

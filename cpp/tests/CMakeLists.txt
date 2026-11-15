@@ -197,6 +197,14 @@ kvikio_add_test(NAME IO_CUFILE_POSIX_ENGINE_TEST SOURCES test_io_cufile_posix_en
 
 kvikio_add_test(NAME IO_DEVICE_COPY_BATCH_TEST SOURCES test_io_device_copy_batch.cpp)
 
+if(TARGET kvikio_engine_uring)
+  # Uses the plugin by name only; the dependency makes sure it is built, and the include path
+  # serves the reactor header the diagnostics interface refers to.
+  kvikio_add_test(NAME IO_URING_ENGINE_TEST SOURCES test_io_uring_engine.cpp)
+  add_dependencies(IO_URING_ENGINE_TEST kvikio_engine_uring)
+  target_link_libraries(IO_URING_ENGINE_TEST PRIVATE kvikio_engine_thirdparty PkgConfig::KVIKIO_LIBURING)
+endif()
+
 kvikio_add_nsys_plugin_test(
   NAME NIC_MONITOR_TEST SOURCES test_nic_monitor.cpp PLUGIN_SOURCES nic/nic_monitor.cpp
 )
