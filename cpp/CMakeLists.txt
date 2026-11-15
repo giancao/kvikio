@@ -65,6 +65,10 @@ set(KvikIO_ABSEIL_INVOCABLE_TARGET
 option(KvikIO_BUILD_URING_ENGINE
        "Build the io_uring engine plugin (libkvikio_engine_uring.so); needs liburing" ON
 )
+option(KvikIO_BUILD_CUFILE_REACTOR_ENGINE
+       "Build the cuFile reactor engine plugin (libkvikio_engine_cufile_reactor.so); needs cufile.h"
+       ON
+)
 # The reactor engines use moodycamel's lock-free queues, which libkvikio.so itself does not.
 # Resolution order: an existing CMake target, a directory holding concurrentqueue.h, else
 # cameron314/concurrentqueue is fetched.
@@ -314,11 +318,7 @@ set_target_properties(
 
 # An engine plugin is a shared library next to libkvikio.so, found there by name by the engine
 # registry. It can also be linked like any library by code that uses the engine's classes directly.
-if(KvikIO_BUILD_URING_ENGINE)
-  find_package(PkgConfig REQUIRED)
-  # GLOBAL: a project embedding KvikIO links the plugin from its own directories.
-  pkg_check_modules(KVIKIO_LIBURING REQUIRED IMPORTED_TARGET GLOBAL liburing)
-
+if(KvikIO_BUILD_URING_ENGINE OR KvikIO_BUILD_CUFILE_REACTOR_ENGINE)
   add_library(kvikio_engine_thirdparty INTERFACE)
   if(KvikIO_MOODYCAMEL_TARGET)
     target_link_libraries(
@@ -350,6 +350,12 @@ if(KvikIO_BUILD_URING_ENGINE)
     kvikio_engine_thirdparty
     INTERFACE KVIKIO_MOODYCAMEL_NAMESPACE=${KvikIO_MOODYCAMEL_NAMESPACE}
   )
+endif()
+
+if(KvikIO_BUILD_URING_ENGINE)
+  find_package(PkgConfig REQUIRED)
+  # GLOBAL: a project embedding KvikIO links the plugin from its own directories.
+  pkg_check_modules(KVIKIO_LIBURING REQUIRED IMPORTED_TARGET GLOBAL liburing)
 
   add_library(kvikio_engine_uring SHARED src/io/uring/uring_engine.cpp src/io/uring/uring_reactor.cpp)
   add_library(kvikio::engine_uring ALIAS kvikio_engine_uring)
@@ -370,6 +376,37 @@ if(KvikIO_BUILD_URING_ENGINE)
     kvikio_engine_uring
     PUBLIC kvikio::kvikio $<BUILD_INTERFACE:kvikio_engine_thirdparty>
            $<BUILD_INTERFACE:PkgConfig::KVIKIO_LIBURING>
+  )
+endif()
+
+# The cuFile reactor loads libcufile at run time: building it needs only cufile.h.
+if(KvikIO_BUILD_CUFILE_REACTOR_ENGINE AND NOT cuFile_FOUND)
+  message(STATUS "cufile.h not found: the cufile_reactor engine plugin is not built")
+endif()
+if(KvikIO_BUILD_CUFILE_REACTOR_ENGINE AND cuFile_FOUND)
+  add_library(
+    kvikio_engine_cufile_reactor SHARED
+    src/io/cufile/cufile_api.cpp src/io/cufile/cufile_engine.cpp src/io/cufile/cufile_reactor.cpp
+    src/io/cufile/platform.cpp
+  )
+  add_library(kvikio::engine_cufile_reactor ALIAS kvikio_engine_cufile_reactor)
+  set_target_properties(
+    kvikio_engine_cufile_reactor
+    PROPERTIES BUILD_RPATH "\$ORIGIN"
+               INSTALL_RPATH "\$ORIGIN"
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               POSITION_INDEPENDENT_CODE ON
+  )
+  target_compile_options(
+    kvikio_engine_cufile_reactor PRIVATE -Wall -Wextra -Wconversion -Wsign-conversion
+  )
+  target_compile_definitions(
+    kvikio_engine_cufile_reactor
+    PRIVATE "KVIKIO_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_${KVIKIO_LOGGING_LEVEL}"
+  )
+  target_link_libraries(
+    kvikio_engine_cufile_reactor PUBLIC kvikio::kvikio $<BUILD_INTERFACE:kvikio_engine_thirdparty>
   )
 endif()
 
@@ -427,6 +464,9 @@ install(
 
 if(TARGET kvikio_engine_uring)
   install(TARGETS kvikio_engine_uring DESTINATION ${lib_dir})
+endif()
+if(TARGET kvikio_engine_cufile_reactor)
+  install(TARGETS kvikio_engine_cufile_reactor DESTINATION ${lib_dir})
 endif()
 
 install(DIRECTORY include/kvikio/ DESTINATION include/kvikio)

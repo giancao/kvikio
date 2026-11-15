@@ -197,6 +197,12 @@ kvikio_add_test(NAME IO_CUFILE_POSIX_ENGINE_TEST SOURCES test_io_cufile_posix_en
 
 kvikio_add_test(NAME IO_DEVICE_COPY_BATCH_TEST SOURCES test_io_device_copy_batch.cpp)
 
+if(TARGET kvikio_engine_cufile_reactor)
+  # Uses the plugin by name only; the dependency makes sure it is built.
+  kvikio_add_test(NAME IO_CUFILE_REACTOR_ENGINE_TEST SOURCES test_io_cufile_reactor_engine.cpp)
+  add_dependencies(IO_CUFILE_REACTOR_ENGINE_TEST kvikio_engine_cufile_reactor)
+endif()
+
 if(TARGET kvikio_engine_uring)
   # Uses the plugin by name only; the dependency makes sure it is built, and the include path
   # serves the reactor header the diagnostics interface refers to.
