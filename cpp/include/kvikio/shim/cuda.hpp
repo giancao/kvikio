@@ -116,6 +116,8 @@ class cudaAPI {
   decltype(cuEventRecord)* EventRecord{nullptr};
   decltype(cuEventQuery)* EventQuery{nullptr};
   decltype(cuLaunchHostFunc)* LaunchHostFunc{nullptr};
+  // Appended after the existing members so their offsets do not change.
+  decltype(cuStreamWaitEvent)* StreamWaitEvent{nullptr};
 
  private:
   cudaAPI();
