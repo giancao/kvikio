@@ -95,6 +95,10 @@ class uring_http_api {
                                       std::function<void(footer_resolve_result)> const& on_result,
                                       std::stop_token stop = {}) = 0;
 
+  /// How many reactors one read is spread over: the configured fan-out, clamped
+  /// to the size of the pool.
+  [[nodiscard]] virtual std::size_t fan_out() const noexcept = 0;
+
   /// Bytes of footer stash currently reserved, and their peak.
   [[nodiscard]] virtual std::size_t footer_stash_reserved_bytes() const noexcept      = 0;
   [[nodiscard]] virtual std::size_t footer_stash_reserved_peak_bytes() const noexcept = 0;
