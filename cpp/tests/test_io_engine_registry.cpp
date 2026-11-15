@@ -213,6 +213,22 @@ TEST(EngineRegistryTest, replaced_engine_belongs_to_whoever_still_holds_it)
   EXPECT_EQ(first->shutdowns.load(), 1);
 }
 
+TEST(EngineRegistryTest, create_makes_a_started_engine_without_selecting_it)
+{
+  engine_registry registry;
+  std::shared_ptr<fake_engine> made;
+  registry.register_factory("alpha", make_factory("alpha", &made));
+  auto own = registry.create("alpha");
+  ASSERT_NE(made, nullptr);
+  EXPECT_EQ(own.get(), made.get());
+  EXPECT_TRUE(made->started.load());
+  EXPECT_EQ(registry.current(engine_route::local), nullptr);
+  EXPECT_EQ(own.use_count(), 2) << "only the caller and this test hold it";
+
+  EXPECT_THAT(selection_error([&] { (void)registry.create("no_such_engine"); }),
+              HasSubstr("cannot create engine 'no_such_engine'"));
+}
+
 TEST(EngineRegistryTest, process_wide_instance_is_one_object)
 {
   EXPECT_EQ(&engine_registry::instance(), &engine_registry::instance());

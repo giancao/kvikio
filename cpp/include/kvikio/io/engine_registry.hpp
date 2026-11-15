@@ -113,6 +113,19 @@ class engine_registry {
                                  std::string_view name,
                                  engine_options const& options = engine_options{});
 
+  /**
+   * @brief Create and start an engine without selecting it.
+   *
+   * For a component that wants an engine of its own (its own threads and
+   * staging) next to the one selected for a route. The caller owns the engine
+   * and shuts it down.
+   *
+   * @throws engine_selection_error if the name is unknown, its plugin cannot be
+   *         loaded, or the engine cannot be created or started.
+   */
+  [[nodiscard]] std::shared_ptr<engine> create(std::string_view name,
+                                               engine_options const& options = {});
+
   /// The engine selected for @p route, or null if none is. Lock-free. The
   /// pointer is valid until the next @ref select of this route or @ref shutdown;
   /// a component that outlives those takes @ref acquire instead.
@@ -135,6 +148,8 @@ class engine_registry {
   /// The factory of @p name, loading its plugin if it has none yet. Throws
   /// @c engine_selection_error.
   [[nodiscard]] engine_factory factory_for(std::string_view name);
+  [[nodiscard]] std::shared_ptr<engine> make_started(std::string_view name,
+                                                     engine_options const& options);
 
   /// Loads the plugin of @p name and returns its factory. Takes no lock while
   /// the plugin's code runs. Throws @c engine_selection_error.
