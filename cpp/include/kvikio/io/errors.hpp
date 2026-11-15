@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 
 namespace kvikio::io {
 
@@ -43,6 +44,73 @@ class descriptor_mismatch_error : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
 };
+
+/**
+ * @brief Raised by @c s3_request_authorizer implementations when credential
+ *        acquisition or signing fails.
+ *
+ * Surfaces from:
+ *   - missing or malformed static credentials (caught at provider construction
+ *     or first call),
+ *   - misconfigured endpoint / region,
+ *   - underlying signing-library failure (HMAC / SHA256),
+ *   - upstream credential broker errors (in future refresh-aware impls).
+ *
+ * Backends translate this into the broader IO error path of the caller.
+ * Future IO-layer error types share this header.
+ */
+class credential_error : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+/**
+ * @brief A read found the object to be a different version from the one its
+ *        datasource was opened on.
+ *
+ * Raised by the REST reactor when a conditional range GET is refused (412) or
+ * when an accepted response does not carry the validator the open recorded.
+ * Nothing from such a response is published; the error is terminal for the
+ * read and is not retried.  @c observed_tag() is the response's ETag as
+ * received, or empty when the response carried none or was refused (412).
+ */
+class object_changed_error : public std::runtime_error {
+ public:
+  object_changed_error(std::string object_path, std::string expected_tag, std::string observed_tag)
+    : std::runtime_error(describe(object_path, observed_tag)),
+      _object_path(std::move(object_path)),
+      _expected_tag(std::move(expected_tag)),
+      _observed_tag(std::move(observed_tag))
+  {
+  }
+
+  [[nodiscard]] std::string const& object_path() const noexcept { return _object_path; }
+  [[nodiscard]] std::string const& expected_tag() const noexcept { return _expected_tag; }
+  [[nodiscard]] std::string const& observed_tag() const noexcept { return _observed_tag; }
+
+ private:
+  static std::string describe(std::string const& path, std::string const& observed)
+  {
+    return "object " + path + " changed since it was opened" +
+           (observed.empty() ? " (no matching validator in the response)"
+                             : " (response validator differs)");
+  }
+
+  std::string _object_path;
+  std::string _expected_tag;
+  std::string _observed_tag;
+};
+
+/**
+ * @brief The backend does not implement this operation yet.
+ *
+ * Reported by every write and flush entry point of a backend that serves
+ * reads only (the REST context and reactor), and by
+ * the @c ioctx write front ends when the backend cannot write at all.  A
+ * @c std::system_error with @c std::errc::not_supported, so callers that catch
+ * @c std::system_error and compare its code keep working; the message names
+ * the backend and operation and says "not yet implemented".
+ */
 
 /**
  * @brief Selecting an engine failed: the name is unknown, its plugin could not

@@ -65,6 +65,9 @@ set(KvikIO_ABSEIL_INVOCABLE_TARGET
 option(KvikIO_BUILD_URING_ENGINE
        "Build the io_uring engine plugin (libkvikio_engine_uring.so); needs liburing" ON
 )
+option(KvikIO_BUILD_URING_HTTP_ENGINE
+       "Build the io_uring HTTP engine plugin for object stores; needs liburing and OpenSSL" ON
+)
 option(KvikIO_BUILD_CUFILE_REACTOR_ENGINE
        "Build the cuFile reactor engine plugin (libkvikio_engine_cufile_reactor.so); needs cufile.h"
        ON
@@ -327,7 +330,10 @@ set_target_properties(
 
 # An engine plugin is a shared library next to libkvikio.so, found there by name by the engine
 # registry. It can also be linked like any library by code that uses the engine's classes directly.
-if(KvikIO_BUILD_URING_ENGINE OR KvikIO_BUILD_CUFILE_REACTOR_ENGINE)
+if(KvikIO_BUILD_URING_ENGINE
+   OR KvikIO_BUILD_CUFILE_REACTOR_ENGINE
+   OR KvikIO_BUILD_URING_HTTP_ENGINE
+)
   add_library(kvikio_engine_thirdparty INTERFACE)
   if(KvikIO_MOODYCAMEL_TARGET)
     target_link_libraries(
@@ -361,10 +367,13 @@ if(KvikIO_BUILD_URING_ENGINE OR KvikIO_BUILD_CUFILE_REACTOR_ENGINE)
   )
 endif()
 
-if(KvikIO_BUILD_URING_ENGINE)
+if(KvikIO_BUILD_URING_ENGINE OR KvikIO_BUILD_URING_HTTP_ENGINE)
   find_package(PkgConfig REQUIRED)
   # GLOBAL: a project embedding KvikIO links the plugin from its own directories.
   pkg_check_modules(KVIKIO_LIBURING REQUIRED IMPORTED_TARGET GLOBAL liburing)
+endif()
+
+if(KvikIO_BUILD_URING_ENGINE)
 
   add_library(kvikio_engine_uring SHARED src/io/uring/uring_engine.cpp src/io/uring/uring_reactor.cpp)
   add_library(kvikio::engine_uring ALIAS kvikio_engine_uring)
@@ -385,6 +394,56 @@ if(KvikIO_BUILD_URING_ENGINE)
     kvikio_engine_uring
     PUBLIC kvikio::kvikio $<BUILD_INTERFACE:kvikio_engine_thirdparty>
            $<BUILD_INTERFACE:PkgConfig::KVIKIO_LIBURING>
+  )
+endif()
+
+# The layers under the io_uring HTTP engine: TLS, the HTTP codec, the network transport and S3
+# request signing. An object library for now; it becomes part of the engine plugin. OpenSSL is a
+# dependency of the plugin only.
+if(KvikIO_BUILD_URING_HTTP_ENGINE)
+  find_package(OpenSSL REQUIRED)
+  add_library(
+    kvikio_uring_http_layers OBJECT
+    src/io/rest/errc.cpp
+    src/io/rest/http/chunked_decoder.cpp
+    src/io/rest/http/classify.cpp
+    src/io/rest/http/content_range.cpp
+    src/io/rest/http/iovec_sink.cpp
+    src/io/rest/http/request_head.cpp
+    src/io/rest/http/response_parser.cpp
+    src/io/rest/net/dns_resolver.cpp
+    src/io/rest/net/tls_stream.cpp
+    src/io/rest/net/uring_transport.cpp
+    src/io/rest/s3/sigv4.cpp
+    src/io/rest/s3/sigv4_authorizer.cpp
+    src/io/tls/evp_aead.cpp
+    src/io/tls/key_schedule.cpp
+    src/io/tls/ktls.cpp
+    src/io/tls/openssl_context.cpp
+    src/io/tls/openssl_session.cpp
+    src/io/tls/openssl_session_cache.cpp
+    src/io/tls/openssl_trust_store.cpp
+    src/io/tls/record_opener.cpp
+    src/io/tls/tls.cpp
+  )
+  set_target_properties(
+    kvikio_uring_http_layers
+    PROPERTIES CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               POSITION_INDEPENDENT_CODE ON
+  )
+  # The layers include each other's private headers as "io/...", relative to src/.
+  target_include_directories(kvikio_uring_http_layers PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_compile_options(
+    kvikio_uring_http_layers PRIVATE -Wall -Wextra -Wconversion -Wsign-conversion
+  )
+  target_compile_definitions(
+    kvikio_uring_http_layers
+    PRIVATE "KVIKIO_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_${KVIKIO_LOGGING_LEVEL}"
+  )
+  target_link_libraries(
+    kvikio_uring_http_layers PUBLIC kvikio::kvikio $<BUILD_INTERFACE:kvikio_engine_thirdparty>
+                                    PkgConfig::KVIKIO_LIBURING OpenSSL::SSL OpenSSL::Crypto
   )
 endif()
 
