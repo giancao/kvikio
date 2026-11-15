@@ -99,6 +99,18 @@ class KVIKIO_EXPORT uring_http_engine final
 
   ~uring_http_engine() override;
 
+  /// Number of reactors in the pool, and the counters and queued bytes of one
+  /// of them (diagnostics; @p i must be less than the count).
+  [[nodiscard]] std::size_t reactor_count() const noexcept { return _reactors.size(); }
+  [[nodiscard]] transport_stats reactor_stats(std::size_t i) const { return _reactors.at(i)->stats(); }
+  [[nodiscard]] std::size_t reactor_queued_bytes(std::size_t i) const
+  {
+    return _reactors.at(i)->queued_bytes();
+  }
+
+  /// This pool's placement (plan and interface), computed at construction.
+  [[nodiscard]] detail::pool_placement const& placement() const noexcept { return *_placement; }
+
   /// Counters of the whole pool: the reactors' @c transport_stats summed (extremes for the MSS
   /// and in-flight peaks).  A snapshot; safe while the pool runs.
   [[nodiscard]] transport_stats stats() const noexcept override;

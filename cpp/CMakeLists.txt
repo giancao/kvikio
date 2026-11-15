@@ -219,6 +219,7 @@ set(SOURCES
     "src/detail/utils.cpp"
     "src/exec/admission_control.cpp"
     "src/exec/thread_util.cpp"
+    "src/io/rest/config.cpp"
     "src/io/rest/reactor_placement.cpp"
     "src/io/cufile_posix_engine.cpp"
     "src/io/detail/local_descriptor.cpp"
@@ -407,7 +408,6 @@ if(KvikIO_BUILD_URING_HTTP_ENGINE)
   find_package(OpenSSL REQUIRED)
   add_library(
     kvikio_engine_uring_http SHARED
-    src/io/rest/config.cpp
     src/io/rest/errc.cpp
     src/io/rest/rest_reactor.cpp
     src/io/rest/shared_services.cpp
