@@ -303,6 +303,13 @@ if(KvikIO_USE_ABSEIL_INVOCABLE)
   target_compile_definitions(kvikio PUBLIC KVIKIO_USE_ABSEIL_INVOCABLE)
 endif()
 
+# What the cuFile library of this process can do (kvikio::io::cufile::probe_platform). It is in
+# libkvikio.so rather than in the cufile_reactor plugin so that a host can ask without loading the
+# plugin. libcufile is opened with dlopen(), so this adds no link dependency.
+if(cuFile_FOUND)
+  target_sources(kvikio PRIVATE src/io/cufile/cufile_api.cpp src/io/cufile/platform.cpp)
+endif()
+
 set_target_properties(
   kvikio
   PROPERTIES BUILD_RPATH "\$ORIGIN"
@@ -386,8 +393,7 @@ endif()
 if(KvikIO_BUILD_CUFILE_REACTOR_ENGINE AND cuFile_FOUND)
   add_library(
     kvikio_engine_cufile_reactor SHARED
-    src/io/cufile/cufile_api.cpp src/io/cufile/cufile_engine.cpp src/io/cufile/cufile_reactor.cpp
-    src/io/cufile/platform.cpp
+    src/io/cufile/cufile_engine.cpp src/io/cufile/cufile_reactor.cpp
   )
   add_library(kvikio::engine_cufile_reactor ALIAS kvikio_engine_cufile_reactor)
   set_target_properties(

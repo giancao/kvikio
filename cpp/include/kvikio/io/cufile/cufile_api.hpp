@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <kvikio/shim/utils.hpp>
+
 #include <cufile.h>
 
 namespace kvikio::io::cufile {
@@ -25,7 +27,7 @@ namespace kvikio::io::cufile {
  * This is a private detail of the cuFile backend; nothing outside the backend and its tests
  * should include this header.
  */
-struct cufile_api {
+struct KVIKIO_EXPORT cufile_api {
   decltype(&cuFileDriverOpen) driver_open{nullptr};
   decltype(&cuFileDriverGetProperties) driver_get_properties{nullptr};
   decltype(&cuFileHandleRegister) handle_register{nullptr};
