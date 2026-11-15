@@ -316,7 +316,8 @@ set_target_properties(
 # registry. It can also be linked like any library by code that uses the engine's classes directly.
 if(KvikIO_BUILD_URING_ENGINE)
   find_package(PkgConfig REQUIRED)
-  pkg_check_modules(KVIKIO_LIBURING REQUIRED IMPORTED_TARGET liburing)
+  # GLOBAL: a project embedding KvikIO links the plugin from its own directories.
+  pkg_check_modules(KVIKIO_LIBURING REQUIRED IMPORTED_TARGET GLOBAL liburing)
 
   add_library(kvikio_engine_thirdparty INTERFACE)
   if(KvikIO_MOODYCAMEL_TARGET)
