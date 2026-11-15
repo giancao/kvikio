@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 #include <kvikio/io/errors.hpp>
+#include <kvikio/io/nic_topology.hpp>
 #include <kvikio/io/types.hpp>
 
 #include "utils/fake_engine.hpp"
@@ -138,11 +139,11 @@ TEST(IoTypesTest, reporting_fragments_calls_back_once_for_a_short_list)
   std::vector<fragment> list{fragment{0, &memory[0], 1, &memory[0]},
                              fragment{9, &memory[1], 1, &memory[1]}};
   std::vector<std::vector<fragment_handle>> calls;
-  prepared_io_completion completion{[&calls](std::span<fragment_handle const> handles,
-                                             bool ok) noexcept {
-    EXPECT_FALSE(ok);
-    calls.emplace_back(handles.begin(), handles.end());
-  }};
+  prepared_io_completion completion{
+    [&calls](std::span<fragment_handle const> handles, bool ok) noexcept {
+      EXPECT_FALSE(ok);
+      calls.emplace_back(handles.begin(), handles.end());
+    }};
   host_buffer buffer{std::move(list)};
   completion(buffer.fragments(), false);
   ASSERT_EQ(calls.size(), 1u);
@@ -235,4 +236,31 @@ TEST(IoTypesTest, unimplemented_entry_points_say_so)
     EXPECT_EQ(e.code(), std::make_error_code(std::errc::not_supported));
   }
   EXPECT_THROW(engine.flush_async(object, io_priority::automatic).get(), not_implemented_error);
+}
+
+TEST(NicTopologyTest, steered_means_a_strict_subset_of_the_node)
+{
+  nic_topology nic;
+  nic.node_cpus = {0, 1, 2, 3};
+  EXPECT_FALSE(nic.irqs_steered()) << "no queue interrupts";
+
+  nic.queue_irqs = {nic_queue_irq{40, 0, {1}, {1}}, nic_queue_irq{41, 1, {2}, {2}}};
+  nic.irq_cpus   = {1, 2};
+  EXPECT_TRUE(nic.irqs_steered());
+
+  // Delivered to one CPU, but asked to go anywhere on the node: spread.
+  nic.queue_irqs[0].requested_cpus = {0, 1, 2, 3};
+  EXPECT_FALSE(nic.irqs_steered());
+  EXPECT_TRUE(nic.irqs_steered(4));
+
+  // The interrupt CPUs cover the node: nothing to align with.
+  nic.queue_irqs[0].requested_cpus = {1};
+  nic.irq_cpus                     = {0, 1, 2, 3};
+  EXPECT_FALSE(nic.irqs_steered());
+}
+
+TEST(NicTopologyTest, cpu_lists_are_formatted_as_ranges)
+{
+  EXPECT_EQ(format_cpu_list({}), "");
+  EXPECT_EQ(format_cpu_list({3, 0, 1, 2, 8, 11, 10, 10}), "0-3,8,10-11");
 }
