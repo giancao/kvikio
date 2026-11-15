@@ -215,6 +215,7 @@ set(SOURCES
     "src/detail/string_utils.cpp"
     "src/detail/utils.cpp"
     "src/exec/admission_control.cpp"
+    "src/exec/thread_util.cpp"
     "src/io/cufile_posix_engine.cpp"
     "src/io/detail/local_descriptor.cpp"
     "src/io/engine.cpp"
