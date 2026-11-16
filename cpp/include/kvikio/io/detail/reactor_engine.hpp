@@ -67,6 +67,9 @@ class reactor_engine : public engine, public reactor_dispatch<Reactor, reactor_e
     _caps.priority             = true;
     _caps.prefers_bulk_io      = reactor_traits_t::prefers_bulk_io;
     _caps.min_alignment        = this->_config.min_alignment_requirement();
+    if constexpr (requires { this->_config.write_alignment_requirement(); }) {
+      _caps.write_alignment = this->_config.write_alignment_requirement();
+    }
     _caps.merge_gap            = this->_config.merge_gap_size();
     _caps.max_concurrent_scans = this->_config.n_max_concurrent_scans;
     refresh_staging_block_size();

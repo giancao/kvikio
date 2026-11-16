@@ -159,6 +159,14 @@ struct config {
   /// every layer rediscovering it.
   [[nodiscard]] std::size_t min_alignment_requirement() const noexcept { return io::IO_BLOCK_SIZE; }
 
+  /// Writes go through O_DIRECT when @c use_odirect is set, and O_DIRECT only
+  /// writes whole blocks from a block boundary; without it a write may be any
+  /// range.
+  [[nodiscard]] std::size_t write_alignment_requirement() const noexcept
+  {
+    return use_odirect ? io::IO_BLOCK_SIZE : std::size_t{1};
+  }
+
   /// A local read is a syscall against NVMe, so bridging is only worth it when
   /// the bridged bytes cost less than the extra request -- one page.
   [[nodiscard]] std::size_t merge_gap_size() const noexcept { return io::IO_BLOCK_SIZE; }
