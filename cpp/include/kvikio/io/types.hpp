@@ -21,6 +21,7 @@
 #include <kvikio/exec/invocable.hpp>
 #include <kvikio/io/byte_range.hpp>
 #include <kvikio/io/object_identity.hpp>
+#include <system_error>
 
 #include <cuda.h>
 #include <sys/types.h>
@@ -564,7 +565,29 @@ class io_object : public std::enable_shared_from_this<io_object> {
   /// See @ref client_tag.
   void set_client_tag(std::uint64_t tag) noexcept { _client_tag = tag; }
 
+  /// State the layer above the engine attaches to this object right after
+  /// opening it, before the object is shared, and keeps for the object's
+  /// lifetime. Engines neither read nor write it.
+  [[nodiscard]] std::shared_ptr<void> const& client_state() const noexcept { return _client_state; }
+
+  /// See @ref client_state.
+  void set_client_state(std::shared_ptr<void> state) noexcept { _client_state = std::move(state); }
+
+  /// The size of the underlying object as it is now, re-read from it. A writable
+  /// object's @ref size follows only the writes that completed through it; this
+  /// also sees what a write that failed part-way, or another writer, left
+  /// behind, and makes @ref size report it. Default: @ref size.
+  [[nodiscard]] virtual std::size_t sync_size() const { return size(); }
+
+  /// Set the size of the underlying object and of this object to @p bytes
+  /// (@c ftruncate for a local file). Default: @c std::errc::not_supported.
+  virtual void resize(std::size_t /*bytes*/) const
+  {
+    throw std::system_error(std::make_error_code(std::errc::not_supported), "io_object: resize");
+  }
+
  private:
+  std::shared_ptr<void> _client_state;
   std::uint64_t _client_tag{0};
   std::uint64_t const _open_generation = next_open_generation();
 };

@@ -5,6 +5,9 @@
 
 #pragma once
 
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
 #include <kvikio/exec/semi_future.hpp>
 #include <kvikio/io/byte_range.hpp>
 #include <kvikio/io/detail/concurrent_queue.hpp>
@@ -18,6 +21,7 @@
 #include <kvikio/io/uring/config.hpp>
 #include <kvikio/io/uring/types.hpp>
 #include <kvikio/shim/cuda.hpp>
+#include <system_error>
 
 #include <liburing.h>
 
@@ -110,6 +114,29 @@ class local_io_object : public io_object {
   void note_written(std::size_t end) const noexcept override
   {
     if (writable()) atomic_store_max(_file_size, end);
+  }
+
+  [[nodiscard]] std::size_t sync_size() const override
+  {
+    struct ::stat status{};
+    if (::fstat(_fd.get(), &status) != 0) {
+      throw std::system_error(errno, std::generic_category(), "local_io_object: fstat");
+    }
+    auto const bytes = static_cast<std::size_t>(status.st_size);
+    if (writable()) _file_size.store(bytes, std::memory_order_release);
+    return bytes;
+  }
+
+  void resize(std::size_t bytes) const override
+  {
+    if (!writable()) {
+      throw std::system_error(std::make_error_code(std::errc::bad_file_descriptor),
+                              "local_io_object: resize of a read-only object");
+    }
+    if (::ftruncate(_fd.get(), static_cast<off_t>(bytes)) != 0) {
+      throw std::system_error(errno, std::generic_category(), "local_io_object: ftruncate");
+    }
+    _file_size.store(bytes, std::memory_order_release);
   }
 
   [[nodiscard]] int fd() const noexcept { return _fd.get(); }
