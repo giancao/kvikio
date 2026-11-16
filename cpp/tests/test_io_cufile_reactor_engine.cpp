@@ -84,6 +84,15 @@ TEST_F(CufileReactorEngineTest, is_a_plugin_and_declares_what_it_cannot_do)
   EXPECT_TRUE(eng->supports(path));
 }
 
+// The reactors' own page-locked scratch is a fixed overhead a host reads from the config.
+TEST(CufileReactorConfigTest, reports_the_pinned_scratch_of_a_pool)
+{
+  using kvikio::io::cufile::config;
+  EXPECT_EQ(config::pinned_scratch_bytes(0), 0u);
+  EXPECT_EQ(config::pinned_scratch_bytes(1), std::size_t{16} << 20);
+  EXPECT_EQ(config::pinned_scratch_bytes(4), std::size_t{64} << 20);
+}
+
 TEST_F(CufileReactorEngineTest, reads_host_and_device_destinations)
 {
   auto eng    = registry.select(engine_route::local, "cufile_reactor");
