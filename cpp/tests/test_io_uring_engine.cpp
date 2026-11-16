@@ -245,6 +245,16 @@ TEST_F(UringEngineTest, writes_host_and_device_sources_and_reads_them_back)
   EXPECT_EQ(back, pattern_bytes(0, back.size()));
 }
 
+// O_DIRECT is what makes writes need whole blocks: the engine says so only when it uses it.
+TEST(UringConfigTest, write_alignment_follows_odirect)
+{
+  uring::config cfg;
+  cfg.use_odirect = true;
+  EXPECT_EQ(cfg.write_alignment_requirement(), kvikio::io::IO_BLOCK_SIZE);
+  cfg.use_odirect = false;
+  EXPECT_EQ(cfg.write_alignment_requirement(), 1u);
+}
+
 // The diagnostics are reached through a header-only interface.
 TEST_F(UringEngineTest, exposes_reactor_gauges)
 {

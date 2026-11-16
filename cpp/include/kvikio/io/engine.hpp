@@ -86,6 +86,10 @@ struct engine_capabilities {
   /// The smallest unit the engine can address, in bytes. A read is widened to a
   /// multiple of it before being issued.
   std::size_t min_alignment{1};
+  /// Above 1 when the engine writes with O_DIRECT: a write must then start on a
+  /// multiple of it and cover whole multiples, or the engine has to write the
+  /// rest through the page cache. 1 when writes have no such requirement.
+  std::size_t write_alignment{1};
   /// The largest gap between two ranges still worth bridging into one request,
   /// in bytes.
   std::size_t merge_gap{0};
