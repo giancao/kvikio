@@ -5,9 +5,6 @@
 
 #pragma once
 
-#include <sys/stat.h>
-#include <unistd.h>
-#include <cerrno>
 #include <kvikio/io/cufile/config.hpp>
 #include <kvikio/io/cufile/cufile_options.hpp>
 #include <kvikio/io/detail/cuda_event.hpp>
@@ -16,7 +13,6 @@
 #include <kvikio/io/detail/tiered_queue.hpp>
 #include <kvikio/io/object_identity.hpp>
 #include <kvikio/io/types.hpp>
-#include <system_error>
 
 #include <kvikio/io/detail/file_descriptor.hpp>
 #include <kvikio/io/detail/slot_pool.hpp>
@@ -101,29 +97,6 @@ class KVIKIO_EXPORT cufile_io_object final : public io_object, public cufile_obj
   void note_written(std::size_t end) const noexcept override
   {
     if (writable()) atomic_store_max(_file_size, end);
-  }
-
-  [[nodiscard]] std::size_t sync_size() const override
-  {
-    struct ::stat status{};
-    if (::fstat(_buffered_fd.get(), &status) != 0) {
-      throw std::system_error(errno, std::generic_category(), "cufile_io_object: fstat");
-    }
-    auto const bytes = static_cast<std::size_t>(status.st_size);
-    if (writable()) _file_size.store(bytes, std::memory_order_release);
-    return bytes;
-  }
-
-  void resize(std::size_t bytes) const override
-  {
-    if (!writable()) {
-      throw std::system_error(std::make_error_code(std::errc::bad_file_descriptor),
-                              "cufile_io_object: resize of a read-only object");
-    }
-    if (::ftruncate(_buffered_fd.get(), static_cast<off_t>(bytes)) != 0) {
-      throw std::system_error(errno, std::generic_category(), "cufile_io_object: ftruncate");
-    }
-    _file_size.store(bytes, std::memory_order_release);
   }
 
   /// The buffered fd (page cache).  Always valid.
