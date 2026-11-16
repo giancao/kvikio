@@ -88,6 +88,19 @@ RemoteMultiTransfer::~RemoteMultiTransfer()
   }
 }
 
+void RemoteMultiTransfer::report_failed(std::exception_ptr eptr) noexcept
+{
+  if (hooks != nullptr) {
+    hooks->fail(std::move(eptr));
+    return;
+  }
+  try {
+    aggregate->on_subrange_failed(std::move(eptr));
+  } catch (...) {
+    KVIKIO_LOG_ERROR("RemoteMultiTransfer: reporting a failure threw");
+  }
+}
+
 RemoteMultiAggregateContext::RemoteMultiAggregateContext(std::size_t num_subranges)
   : _subranges_left{num_subranges}
 {
@@ -209,7 +222,7 @@ void MultiPollReactor::submit(std::vector<std::unique_ptr<RemoteMultiTransfer>> 
   }
   if (fail_reason) {
     for (auto& transfer : transfers) {
-      transfer->aggregate->on_subrange_failed(fail_reason);
+      transfer->report_failed(fail_reason);
     }
     return;
   }
@@ -285,6 +298,21 @@ void MultiPollReactor::io_thread_main()
             break;
           }
 
+          if (transfer->hooks != nullptr) {
+            // An engine's transfer takes its own resources. The limiter slot goes back when
+            // `slot` is destroyed on the paths that do not attach.
+            auto const admission = transfer->hooks->admit(*transfer);
+            if (admission == RemoteMultiTransferHooks::Admission::DEFERRED) {
+              deferred_for_resource = true;
+              deferred_transfers.push_back(std::move(transfer));
+              continue;
+            }
+            if (admission == RemoteMultiTransferHooks::Admission::FAILED) {
+              transfer.reset();
+              continue;
+            }
+          }
+
           if (transfer->is_device) {
             // Gate 2 caps bounce-buffer use per (reactor thread, CUDA context) across all pipeline
             // phases. A limiter slot freed at libcurl completion does not free the buffer, which
@@ -307,7 +335,7 @@ void MultiPollReactor::io_thread_main()
           CURL* easy    = transfer->curl->handle();
           auto const mc = curl_multi_add_handle(_curl_multi, easy);
           if (mc != CURLM_OK) {
-            transfer->aggregate->on_subrange_failed(std::make_exception_ptr(std::runtime_error(
+            transfer->report_failed(std::make_exception_ptr(std::runtime_error(
               std::string("curl_multi_add_handle: ") + curl_multi_strerror(mc))));
             transfer.reset();
             KVIKIO_FAIL(std::string("curl_multi_add_handle: ") + curl_multi_strerror(mc),
@@ -358,7 +386,9 @@ void MultiPollReactor::io_thread_main()
 
         std::exception_ptr transfer_err;
         try {
-          if (res == CURLE_OK && !transfer->ctx.overflow_error) {
+          if (res == CURLE_OK && !transfer->ctx.overflow_error && transfer->hooks != nullptr) {
+            transfer->hooks->complete(*transfer, _curl_multi);
+          } else if (res == CURLE_OK && !transfer->ctx.overflow_error) {
             if (transfer->is_device) {
               // Phase A (network -> pinned) done. Now schedule Phase B (pinned -> device) on this
               // (thread, ctx) stream and hand the buffer to a cuLaunchHostFunc recycle callback so
@@ -416,7 +446,7 @@ void MultiPollReactor::io_thread_main()
         } catch (...) {
           transfer_err = std::current_exception();
         }
-        if (transfer_err) { transfer->aggregate->on_subrange_failed(transfer_err); }
+        if (transfer_err) { transfer->report_failed(transfer_err); }
       }
 
       // Stage (4): Wait for socket activity, a wakeup, a timeout, or elapsed backoff for retry.
@@ -470,12 +500,14 @@ void MultiPollReactor::requeue_for_retry(std::unique_ptr<RemoteMultiTransfer> tr
 {
   using BounceBufferCache = BounceBufferCachePerThreadAndContext<CudaPinnedAllocator>;
 
-  // Extend the lifetime of aggregate (a shared pointer).
+  // Extend the lifetime of aggregate (a shared pointer). Null for an engine's transfer.
   auto aggregate = transfer->aggregate;
+  auto* hooks    = transfer->hooks.get();
 
   try {
     transfer->attachment.reset();
     transfer->slot.reset();
+    if (hooks != nullptr) { hooks->reset_for_retry(*transfer); }
 
     if (transfer->is_device && transfer->buffer.get() != nullptr) {
       PushAndPopContext c(transfer->device_ctx);
@@ -488,7 +520,12 @@ void MultiPollReactor::requeue_for_retry(std::unique_ptr<RemoteMultiTransfer> tr
     transfer->ready_at = ready_at;
     _pending.push_back(std::move(transfer));
   } catch (...) {
-    aggregate->on_subrange_failed(std::current_exception());
+    // `transfer` is still owned here whenever something above threw, so its hooks are alive.
+    if (aggregate != nullptr) {
+      aggregate->on_subrange_failed(std::current_exception());
+    } else if (hooks != nullptr) {
+      hooks->fail(std::current_exception());
+    }
   }
 }
 
@@ -500,7 +537,7 @@ void MultiPollReactor::fail_all_pending(std::exception_ptr eptr)
     while (!_inbox.empty()) {
       auto transfer = std::move(_inbox.front());
       _inbox.pop_front();
-      transfer->aggregate->on_subrange_failed(eptr);
+      transfer->report_failed(eptr);
     }
   }
 
@@ -508,12 +545,12 @@ void MultiPollReactor::fail_all_pending(std::exception_ptr eptr)
   while (!_pending.empty()) {
     auto transfer = std::move(_pending.front());
     _pending.pop_front();
-    transfer->aggregate->on_subrange_failed(eptr);
+    transfer->report_failed(eptr);
   }
 
   // In-flight is touched only by the I/O thread, which is us, so no lock needed.
   for (auto& in_flight_entry : _in_flight) {
-    in_flight_entry.second->aggregate->on_subrange_failed(eptr);
+    in_flight_entry.second->report_failed(eptr);
   }
   _in_flight.clear();
 }

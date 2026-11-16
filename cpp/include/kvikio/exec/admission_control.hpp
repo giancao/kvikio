@@ -1,0 +1,107 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#pragma once
+
+#include <kvikio/shim/utils.hpp>
+
+#include <condition_variable>
+#include <cstddef>
+#include <mutex>
+#include <stop_token>
+
+namespace kvikio::exec {
+
+// ---------------------------------------------------------------------------
+// admission_control — blocking budget-based backpressure
+// ---------------------------------------------------------------------------
+//
+// Hands out RAII `slot`s that reserve a portion of a fixed budget.  Callers
+// block in acquire() until their request fits, and release automatically on
+// slot destruction.
+//
+// Deadlock-avoidance: if a request is larger than the remaining budget but
+// there are no outstanding slots (nobody to wait on), the request is granted
+// and reserves the entire budget.  This keeps a single oversized request
+// making progress instead of stalling forever.
+
+class KVIKIO_EXPORT admission_control {
+ public:
+  class slot {
+   public:
+    slot() = default;
+    ~slot();
+
+    slot(slot&& o) noexcept;
+    slot& operator=(slot&& o) noexcept;
+
+    slot(slot const&)            = delete;
+    slot& operator=(slot const&) = delete;
+
+    /// Amount actually reserved from the budget.  May exceed the requested
+    /// size in the deadlock-avoidance case.
+    [[nodiscard]] size_t size() const noexcept { return _reserved; }
+
+    /// True if this slot holds a live reservation.
+    explicit operator bool() const noexcept { return _ctrl != nullptr; }
+
+   private:
+    friend class admission_control;
+    slot(admission_control* ctrl, size_t reserved) noexcept : _ctrl(ctrl), _reserved(reserved) {}
+
+    admission_control* _ctrl{nullptr};
+    size_t _reserved{0};
+  };
+
+  explicit admission_control(size_t budget) noexcept;
+  ~admission_control() = default;
+
+  admission_control(admission_control const&)            = delete;
+  admission_control& operator=(admission_control const&) = delete;
+
+  /// Reserve @p size units of budget and return a slot.  Blocks until either:
+  ///   - normal:   in_use + size <= budget  →  reserves exactly @p size
+  ///   - fallback: no slots outstanding but request still can't fit
+  ///               →  reserves the full budget (prevents deadlock for a
+  ///                   request larger than the total budget)
+  /// If @p stop fires during the wait, returns a disengaged slot.
+  [[nodiscard]] slot acquire(size_t size, std::stop_token stop = {});
+
+  /// Non-blocking acquire: reserve exactly @p size units if they fit within
+  /// the remaining budget right now, else return a disengaged slot.  The
+  /// oversized-request fallback of acquire() does not apply here.
+  [[nodiscard]] slot try_acquire(size_t size);
+
+  /// Block until every outstanding slot has been released (i.e. all issued
+  /// tokens are freed and the in-use budget drops back to zero).  Returns
+  /// immediately if nothing is currently reserved.  If @p stop fires first,
+  /// returns early.
+  /// @return true if all slots were freed, false if cut short by @p stop.
+  /// @note This does not prevent new acquire() calls; if acquisitions race in
+  ///       concurrently the method observes whatever momentary drain-to-zero
+  ///       occurs.  Quiesce callers (or stop them acquiring) first if a stable
+  ///       idle is required.
+  bool wait_for_all(std::stop_token stop = {});
+
+  [[nodiscard]] size_t budget() const noexcept { return _budget; }
+
+  /// Bytes currently reserved by live slots.
+  [[nodiscard]] size_t reserved() const;
+
+  /// High-water mark of @ref reserved over this controller's lifetime.
+  [[nodiscard]] size_t peak_reserved() const;
+
+ private:
+  void release(size_t reserved) noexcept;
+
+  const size_t _budget;
+  size_t _in_use{0};
+  size_t _peak{0};
+  size_t _active_slots{0};
+  mutable std::mutex _mtx;
+  std::condition_variable_any _cv;
+};
+
+}  // namespace kvikio::exec

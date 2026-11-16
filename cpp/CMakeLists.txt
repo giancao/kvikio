@@ -53,6 +53,40 @@ option(KvikIO_BUILD_EXAMPLES "Configure CMake to build examples" ON)
 option(KvikIO_BUILD_TESTS "Configure CMake to build tests" ON)
 option(KvikIO_REMOTE_SUPPORT "Configure CMake to build with remote IO support" ON)
 option(KvikIO_BUILD_NSYS_PLUGIN "Configure CMake to build the Nsight Systems NIC plugin" ON)
+option(KvikIO_USE_ABSEIL_INVOCABLE
+       "Back kvikio::exec::invocable with absl::AnyInvocable instead of the built-in implementation"
+       OFF
+)
+set(KvikIO_ABSEIL_INVOCABLE_TARGET
+    ""
+    CACHE STRING
+          "abseil any_invocable CMake target to compile against (default: absl::any_invocable)"
+)
+option(KvikIO_BUILD_URING_ENGINE
+       "Build the io_uring engine plugin (libkvikio_engine_uring.so); needs liburing" ON
+)
+option(KvikIO_BUILD_URING_HTTP_ENGINE
+       "Build the io_uring HTTP engine plugin for object stores; needs liburing and OpenSSL" ON
+)
+option(KvikIO_BUILD_CUFILE_REACTOR_ENGINE
+       "Build the cuFile reactor engine plugin (libkvikio_engine_cufile_reactor.so); needs cufile.h"
+       ON
+)
+# The reactor engines use moodycamel's lock-free queues, which libkvikio.so itself does not.
+# Resolution order: an existing CMake target, a directory holding concurrentqueue.h, else
+# cameron314/concurrentqueue is fetched.
+set(KvikIO_MOODYCAMEL_TARGET
+    ""
+    CACHE STRING "CMake target that carries the moodycamel concurrentqueue headers"
+)
+set(KvikIO_MOODYCAMEL_INCLUDE_DIR
+    ""
+    CACHE PATH "Directory containing the moodycamel concurrentqueue headers"
+)
+set(KvikIO_MOODYCAMEL_NAMESPACE
+    "moodycamel"
+    CACHE STRING "C++ namespace of the moodycamel headers (DuckDB's copy uses duckdb_moodycamel)"
+)
 
 # ##################################################################################################
 # * conda environment ------------------------------------------------------------------------------
@@ -183,6 +217,19 @@ set(SOURCES
     "src/detail/stream.cpp"
     "src/detail/string_utils.cpp"
     "src/detail/utils.cpp"
+    "src/exec/admission_control.cpp"
+    "src/exec/thread_util.cpp"
+    "src/io/rest/config.cpp"
+    "src/io/rest/reactor_placement.cpp"
+    "src/io/cufile_posix_engine.cpp"
+    "src/io/detail/local_descriptor.cpp"
+    "src/io/engine.cpp"
+    "src/io/engine_registry.cpp"
+    "src/io/object_identity.cpp"
+    "src/io/rest/object_store_lister.cpp"
+    "src/io/rest/s3/list_parser.cpp"
+    "src/io/rest/s3/uri_encode.cpp"
+    "src/io/uri_parser.cpp"
     "src/shim/cuda.cpp"
     "src/shim/cufile.cpp"
     "src/shim/utils.cpp"
@@ -196,6 +243,7 @@ if(KvikIO_REMOTE_SUPPORT)
     SOURCES
     "src/hdfs.cpp"
     "src/remote_handle.cpp"
+    "src/io/curl_engine.cpp"
     "src/detail/http_retry.cpp"
     "src/detail/multi_poll_reactor.cpp"
     "src/detail/remote_callback.cpp"
@@ -221,6 +269,8 @@ target_include_directories(
          "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
          "$<BUILD_INTERFACE:${CUDAToolkit_INCLUDE_DIRS}>"
   INTERFACE "$<INSTALL_INTERFACE:include>"
+  # Private headers shared between the library and its engine plugins are included as "io/...".
+  PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
 # Define logging level
@@ -243,6 +293,33 @@ target_compile_definitions(
          $<$<BOOL:${cuFile_VERSION_API_FOUND}>:KVIKIO_CUFILE_VERSION_API_FOUND>
 )
 
+# kvikio::exec::invocable backend. The definition is public: libkvikio, its engine plugins and
+# every consumer must resolve the type to the same implementation. Only the usage requirements of
+# abseil are taken (COMPILE_ONLY), so libkvikio.so gains no link dependency.
+if(KvikIO_USE_ABSEIL_INVOCABLE)
+  if(KvikIO_ABSEIL_INVOCABLE_TARGET)
+    set(_kvikio_absl_target ${KvikIO_ABSEIL_INVOCABLE_TARGET})
+  elseif(TARGET absl::any_invocable)
+    set(_kvikio_absl_target absl::any_invocable)
+  else()
+    find_package(absl CONFIG REQUIRED)
+    set(_kvikio_absl_target absl::any_invocable)
+  endif()
+  message(
+    STATUS
+      "kvikio::exec::invocable backed by absl::AnyInvocable (target '${_kvikio_absl_target}')"
+  )
+  target_link_libraries(kvikio PUBLIC $<BUILD_INTERFACE:$<COMPILE_ONLY:${_kvikio_absl_target}>>)
+  target_compile_definitions(kvikio PUBLIC KVIKIO_USE_ABSEIL_INVOCABLE)
+endif()
+
+# What the cuFile library of this process can do (kvikio::io::cufile::probe_platform). It is in
+# libkvikio.so rather than in the cufile_reactor plugin so that a host can ask without loading the
+# plugin. libcufile is opened with dlopen(), so this adds no link dependency.
+if(cuFile_FOUND)
+  target_sources(kvikio PRIVATE src/io/cufile/cufile_api.cpp src/io/cufile/platform.cpp)
+endif()
+
 set_target_properties(
   kvikio
   PROPERTIES BUILD_RPATH "\$ORIGIN"
@@ -252,6 +329,169 @@ set_target_properties(
              POSITION_INDEPENDENT_CODE ON
              INTERFACE_POSITION_INDEPENDENT_CODE ON
 )
+
+# ##################################################################################################
+# * engine plugins --------------------------------------------------------------------------------
+
+# An engine plugin is a shared library next to libkvikio.so, found there by name by the engine
+# registry. It can also be linked like any library by code that uses the engine's classes directly.
+if(KvikIO_BUILD_URING_ENGINE
+   OR KvikIO_BUILD_CUFILE_REACTOR_ENGINE
+   OR KvikIO_BUILD_URING_HTTP_ENGINE
+)
+  add_library(kvikio_engine_thirdparty INTERFACE)
+  if(KvikIO_MOODYCAMEL_TARGET)
+    target_link_libraries(
+      kvikio_engine_thirdparty INTERFACE $<BUILD_INTERFACE:${KvikIO_MOODYCAMEL_TARGET}>
+    )
+  elseif(KvikIO_MOODYCAMEL_INCLUDE_DIR)
+    if(NOT EXISTS "${KvikIO_MOODYCAMEL_INCLUDE_DIR}/concurrentqueue.h")
+      message(
+        FATAL_ERROR
+          "KvikIO_MOODYCAMEL_INCLUDE_DIR does not contain concurrentqueue.h: ${KvikIO_MOODYCAMEL_INCLUDE_DIR}"
+      )
+    endif()
+    target_include_directories(
+      kvikio_engine_thirdparty INTERFACE $<BUILD_INTERFACE:${KvikIO_MOODYCAMEL_INCLUDE_DIR}>
+    )
+  else()
+    include(FetchContent)
+    FetchContent_Declare(
+      concurrentqueue
+      GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
+      GIT_TAG v1.0.4
+    )
+    FetchContent_MakeAvailable(concurrentqueue)
+    target_include_directories(
+      kvikio_engine_thirdparty INTERFACE $<BUILD_INTERFACE:${concurrentqueue_SOURCE_DIR}>
+    )
+  endif()
+  target_compile_definitions(
+    kvikio_engine_thirdparty
+    INTERFACE KVIKIO_MOODYCAMEL_NAMESPACE=${KvikIO_MOODYCAMEL_NAMESPACE}
+  )
+endif()
+
+if(KvikIO_BUILD_URING_ENGINE OR KvikIO_BUILD_URING_HTTP_ENGINE)
+  find_package(PkgConfig REQUIRED)
+  # GLOBAL: a project embedding KvikIO links the plugin from its own directories.
+  pkg_check_modules(KVIKIO_LIBURING REQUIRED IMPORTED_TARGET GLOBAL liburing)
+endif()
+
+if(KvikIO_BUILD_URING_ENGINE)
+
+  add_library(kvikio_engine_uring SHARED src/io/uring/uring_engine.cpp src/io/uring/uring_reactor.cpp)
+  add_library(kvikio::engine_uring ALIAS kvikio_engine_uring)
+  set_target_properties(
+    kvikio_engine_uring
+    PROPERTIES BUILD_RPATH "\$ORIGIN"
+               INSTALL_RPATH "\$ORIGIN"
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               POSITION_INDEPENDENT_CODE ON
+  )
+  target_compile_options(kvikio_engine_uring PRIVATE -Wall -Wextra -Wconversion -Wsign-conversion)
+  target_compile_definitions(
+    kvikio_engine_uring
+    PRIVATE "KVIKIO_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_${KVIKIO_LOGGING_LEVEL}"
+  )
+  target_link_libraries(
+    kvikio_engine_uring
+    PUBLIC kvikio::kvikio $<BUILD_INTERFACE:kvikio_engine_thirdparty>
+           $<BUILD_INTERFACE:PkgConfig::KVIKIO_LIBURING>
+  )
+endif()
+
+# The io_uring HTTP engine for object stores: the REST reactor with the layers under it (TLS, the
+# HTTP codec, the network transport, S3 request signing). OpenSSL and liburing are dependencies of
+# the plugin only.
+if(KvikIO_BUILD_URING_HTTP_ENGINE)
+  find_package(OpenSSL REQUIRED)
+  add_library(
+    kvikio_engine_uring_http SHARED
+    src/io/rest/errc.cpp
+    src/io/rest/rest_reactor.cpp
+    src/io/rest/shared_services.cpp
+    src/io/rest/uring_http_engine.cpp
+    src/io/rest/http/chunked_decoder.cpp
+    src/io/rest/http/classify.cpp
+    src/io/rest/http/content_range.cpp
+    src/io/rest/http/iovec_sink.cpp
+    src/io/rest/http/request_head.cpp
+    src/io/rest/http/response_parser.cpp
+    src/io/rest/net/dns_resolver.cpp
+    src/io/rest/net/tls_stream.cpp
+    src/io/rest/net/uring_transport.cpp
+    src/io/rest/s3/sigv4.cpp
+    src/io/rest/s3/sigv4_authorizer.cpp
+    src/io/tls/evp_aead.cpp
+    src/io/tls/key_schedule.cpp
+    src/io/tls/ktls.cpp
+    src/io/tls/openssl_context.cpp
+    src/io/tls/openssl_session.cpp
+    src/io/tls/openssl_session_cache.cpp
+    src/io/tls/openssl_trust_store.cpp
+    src/io/tls/record_opener.cpp
+    src/io/tls/tls.cpp
+  )
+  add_library(kvikio::engine_uring_http ALIAS kvikio_engine_uring_http)
+  set_target_properties(
+    kvikio_engine_uring_http
+    PROPERTIES BUILD_RPATH "\$ORIGIN"
+               INSTALL_RPATH "\$ORIGIN"
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               POSITION_INDEPENDENT_CODE ON
+  )
+  # The sources include each other's private headers as "io/...", relative to src/. Code that
+  # tests those layers directly gets the same path.
+  target_include_directories(
+    kvikio_engine_uring_http PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>"
+  )
+  target_compile_options(
+    kvikio_engine_uring_http PRIVATE -Wall -Wextra -Wconversion -Wsign-conversion
+  )
+  target_compile_definitions(
+    kvikio_engine_uring_http
+    PRIVATE "KVIKIO_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_${KVIKIO_LOGGING_LEVEL}"
+  )
+  target_link_libraries(
+    kvikio_engine_uring_http
+    PUBLIC kvikio::kvikio $<BUILD_INTERFACE:kvikio_engine_thirdparty>
+           $<BUILD_INTERFACE:PkgConfig::KVIKIO_LIBURING> $<BUILD_INTERFACE:OpenSSL::SSL>
+           $<BUILD_INTERFACE:OpenSSL::Crypto>
+  )
+endif()
+
+# The cuFile reactor loads libcufile at run time: building it needs only cufile.h.
+if(KvikIO_BUILD_CUFILE_REACTOR_ENGINE AND NOT cuFile_FOUND)
+  message(STATUS "cufile.h not found: the cufile_reactor engine plugin is not built")
+endif()
+if(KvikIO_BUILD_CUFILE_REACTOR_ENGINE AND cuFile_FOUND)
+  add_library(
+    kvikio_engine_cufile_reactor SHARED
+    src/io/cufile/cufile_engine.cpp src/io/cufile/cufile_reactor.cpp
+  )
+  add_library(kvikio::engine_cufile_reactor ALIAS kvikio_engine_cufile_reactor)
+  set_target_properties(
+    kvikio_engine_cufile_reactor
+    PROPERTIES BUILD_RPATH "\$ORIGIN"
+               INSTALL_RPATH "\$ORIGIN"
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               POSITION_INDEPENDENT_CODE ON
+  )
+  target_compile_options(
+    kvikio_engine_cufile_reactor PRIVATE -Wall -Wextra -Wconversion -Wsign-conversion
+  )
+  target_compile_definitions(
+    kvikio_engine_cufile_reactor
+    PRIVATE "KVIKIO_LOG_ACTIVE_LEVEL=RAPIDS_LOGGER_LOG_LEVEL_${KVIKIO_LOGGING_LEVEL}"
+  )
+  target_link_libraries(
+    kvikio_engine_cufile_reactor PUBLIC kvikio::kvikio $<BUILD_INTERFACE:kvikio_engine_thirdparty>
+  )
+endif()
 
 # ##################################################################################################
 # * add benchmarks --------------------------------------------------------------------------------
@@ -304,6 +544,16 @@ install(
   DESTINATION ${lib_dir}
   EXPORT kvikio-exports
 )
+
+if(TARGET kvikio_engine_uring)
+  install(TARGETS kvikio_engine_uring DESTINATION ${lib_dir})
+endif()
+if(TARGET kvikio_engine_cufile_reactor)
+  install(TARGETS kvikio_engine_cufile_reactor DESTINATION ${lib_dir})
+endif()
+if(TARGET kvikio_engine_uring_http)
+  install(TARGETS kvikio_engine_uring_http DESTINATION ${lib_dir})
+endif()
 
 install(DIRECTORY include/kvikio/ DESTINATION include/kvikio)
 install(FILES ${KvikIO_BINARY_DIR}/include/kvikio/version_config.hpp DESTINATION include/kvikio)

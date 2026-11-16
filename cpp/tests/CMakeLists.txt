@@ -159,6 +159,65 @@ kvikio_add_test(NAME MMAP_TEST SOURCES test_mmap.cpp)
 
 kvikio_add_test(NAME CONCURRENT_REQUEST_LIMITER_TEST SOURCES test_concurrent_request_limiter.cpp)
 
+kvikio_add_test(NAME EXEC_SEMI_FUTURE_TEST SOURCES test_exec_semi_future.cpp)
+
+kvikio_add_test(NAME IO_TYPES_TEST SOURCES test_io_types.cpp)
+
+# Engine plugins used by IO_ENGINE_REGISTRY_TEST: one source built in several kinds (see the file).
+set(_kvikio_test_plugin_dir "${KvikIO_BINARY_DIR}/gtests/engine_plugins")
+function(kvikio_add_test_engine_plugin name kind)
+  add_library(kvikio_engine_${name} MODULE engine_plugins/test_engine_plugin.cpp)
+  set_target_properties(
+    kvikio_engine_${name}
+    PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${_kvikio_test_plugin_dir}"
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+  )
+  target_compile_definitions(
+    kvikio_engine_${name} PRIVATE KVIKIO_TEST_PLUGIN_NAME="${name}"
+                                  KVIKIO_TEST_PLUGIN_KIND=${kind}
+  )
+  target_link_libraries(kvikio_engine_${name} PRIVATE kvikio::kvikio)
+endfunction()
+kvikio_add_test_engine_plugin(test_good 0)
+kvikio_add_test_engine_plugin(test_bad_abi 1)
+kvikio_add_test_engine_plugin(test_wrong_name 2)
+kvikio_add_test_engine_plugin(test_start_fails 3)
+
+kvikio_add_test(NAME IO_ENGINE_REGISTRY_TEST SOURCES test_io_engine_registry.cpp)
+target_compile_definitions(
+  IO_ENGINE_REGISTRY_TEST PRIVATE KVIKIO_TEST_ENGINE_PLUGIN_DIR="${_kvikio_test_plugin_dir}"
+)
+add_dependencies(
+  IO_ENGINE_REGISTRY_TEST kvikio_engine_test_good kvikio_engine_test_bad_abi
+  kvikio_engine_test_wrong_name kvikio_engine_test_start_fails
+)
+
+kvikio_add_test(NAME IO_CUFILE_POSIX_ENGINE_TEST SOURCES test_io_cufile_posix_engine.cpp)
+
+kvikio_add_test(NAME IO_DEVICE_COPY_BATCH_TEST SOURCES test_io_device_copy_batch.cpp)
+
+if(TARGET kvikio_engine_cufile_reactor)
+  # Uses the plugin by name only; the dependency makes sure it is built.
+  kvikio_add_test(NAME IO_CUFILE_REACTOR_ENGINE_TEST SOURCES test_io_cufile_reactor_engine.cpp)
+  add_dependencies(IO_CUFILE_REACTOR_ENGINE_TEST kvikio_engine_cufile_reactor)
+endif()
+
+if(TARGET kvikio_engine_uring_http)
+  # Uses the plugin by name only; the dependency makes sure it is built.
+  kvikio_add_test(NAME IO_URING_HTTP_ENGINE_TEST SOURCES test_io_uring_http_engine.cpp)
+  add_dependencies(IO_URING_HTTP_ENGINE_TEST kvikio_engine_uring_http)
+  target_link_libraries(IO_URING_HTTP_ENGINE_TEST PRIVATE kvikio_engine_thirdparty)
+endif()
+
+if(TARGET kvikio_engine_uring)
+  # Uses the plugin by name only; the dependency makes sure it is built, and the include path
+  # serves the reactor header the diagnostics interface refers to.
+  kvikio_add_test(NAME IO_URING_ENGINE_TEST SOURCES test_io_uring_engine.cpp)
+  add_dependencies(IO_URING_ENGINE_TEST kvikio_engine_uring)
+  target_link_libraries(IO_URING_ENGINE_TEST PRIVATE kvikio_engine_thirdparty PkgConfig::KVIKIO_LIBURING)
+endif()
+
 kvikio_add_nsys_plugin_test(
   NAME NIC_MONITOR_TEST SOURCES test_nic_monitor.cpp PLUGIN_SOURCES nic/nic_monitor.cpp
 )
@@ -169,6 +228,7 @@ if(KvikIO_REMOTE_SUPPORT)
   kvikio_add_test(NAME HDFS_TEST SOURCES test_hdfs.cpp utils/hdfs_helper.cpp)
   kvikio_add_test(NAME TLS_TEST SOURCES test_tls.cpp utils/env.cpp)
   kvikio_add_test(NAME URL_TEST SOURCES test_url.cpp)
+  kvikio_add_test(NAME IO_CURL_ENGINE_TEST SOURCES test_io_curl_engine.cpp utils/env.cpp)
   kvikio_add_test(NAME MULTI_POLL_REACTOR_TEST SOURCES test_multi_poll_reactor.cpp utils/env.cpp)
 endif()
 
