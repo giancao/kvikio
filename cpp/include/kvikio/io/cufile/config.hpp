@@ -162,6 +162,27 @@ struct config {
   /// A local read is a syscall against NVMe, so bridging is only worth it when
   /// the bridged bytes cost less than the extra request -- one page.
   [[nodiscard]] std::size_t merge_gap_size() const noexcept { return io::IO_BLOCK_SIZE; }
+
+  /// Slots of a reactor's device-fallback scratch: two, so a read overlaps a copy.
+  static constexpr std::size_t scratch_slots = 2;
+  /// Bytes per scratch slot (the fallback's piece size).
+  static constexpr std::size_t scratch_slot_bytes = 8UL << 20;
+
+  /**
+   * @brief Page-locked memory a pool of @p n_reactors reactors allocates for itself, at most.
+   *
+   * The one exception to "an engine stages only through the injected staging
+   * source": each reactor owns a fixed scratch of @ref scratch_slots x
+   * @ref scratch_slot_bytes that it allocates on its first transfer through the
+   * device fallback and returns to a process-wide pool when it stops (the pool is
+   * never freed, and later reactors reuse it). It is a fixed overhead, not a
+   * function of the load, and it is not drawn from the host's memory budget:
+   * a host reads its size here to account for it.
+   */
+  [[nodiscard]] static constexpr std::size_t pinned_scratch_bytes(std::size_t n_reactors) noexcept
+  {
+    return n_reactors * scratch_slots * scratch_slot_bytes;
+  }
 };
 
 }  // namespace kvikio::io::cufile

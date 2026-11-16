@@ -489,10 +489,10 @@ class KVIKIO_EXPORT cufile_reactor {
   };
   using pinned_scratch = std::unique_ptr<std::uint8_t, pinned_deleter>;
 
-  /// Slots of the device-fallback scratch: two, so a read overlaps a copy.
-  static constexpr std::size_t scratch_slots = 2;
-  /// Bytes per scratch slot (the fallback's piece size).
-  static constexpr std::size_t scratch_slot_bytes = 8UL << 20;
+  /// The device-fallback scratch; its size is part of the config, where a host
+  /// reads it (@c config::pinned_scratch_bytes).
+  static constexpr std::size_t scratch_slots      = config::scratch_slots;
+  static constexpr std::size_t scratch_slot_bytes = config::scratch_slot_bytes;
 
   // Worker-only state; touched exclusively from the reactor thread (and by
   // shutdown() once the worker has been joined).
